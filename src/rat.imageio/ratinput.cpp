@@ -69,6 +69,8 @@ public:
 private:
     std::string m_filename;           ///< Stash the filename
     IMG_File *m_file;                 ///< Open image handle
+    int m_subimage;
+    int m_miplevel;
     /// Reset everything to initial state
     void init () { m_file = NULL; }
 
