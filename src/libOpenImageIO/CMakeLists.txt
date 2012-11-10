@@ -136,6 +136,16 @@ if (EMBEDPLUGINS)
     include_directories (${PNG_INCLUDE_DIR} ${JPEG_INCLUDE_DIR})
     include_directories (${TIFF_INCLUDE_DIR} ${ZLIB_INCLUDE_DIR})
 
+    find_package (HDK)
+    if (HDK_FOUND)
+      include_directories (${HDK_INCLUDE_DIR})
+      set (libOpenImageIO_srcs ${libOpenImageIO_srcs}
+             ../rat.imageio/ratinput.cpp)
+      SET(CMAKE_CXX_FLAGS ${HDK_CXX_FLAGS})
+      link_directories (${HDK_LIB_DIR})
+      add_definitions ("-L${HDK_LIBRARIES}")
+    endif()
+
     add_definitions ("-DEMBED_PLUGINS=1")
 
     if (FIELD3D_FOUND AND USE_FIELD3D)
