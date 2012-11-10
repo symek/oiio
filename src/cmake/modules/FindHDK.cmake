@@ -1,45 +1,32 @@
+# Based on Drew Whitehouse hdk-config:
+# http://code.google.com/p/hdk-config/
 
-#
-#    Locate the HDK environment
-#
-# This module defines 
-# HDK_FOUND,
-# HDK_CXX_COMPILER
-# HDK_INCLUDE_DIRS,
-# HDK_DEFINITIONS,
-# HDK_LIBRARY_DIRS,
-# HDK_LIBRARIES,
-# HDK_DSO_INSTALL_DIR
-#
-# For OSX, we have the following as well ...
-#
-# HDK_FRAMEWORK_DIRS,
-# HDK_FRAMEWORKS,
-#
-
-IF (EXISTS "${HT}/" AND IS_DIRECTORY "${HT}/")
+IF (EXISTS "$ENV{HT}/" AND IS_DIRECTORY "$ENV{HT}/")
 	SET(HDK_FOUND 1)
 	set(HDK_CXX_COMPILER g++)
-	set(HDK_INCLUDE_DIR ${HT}/include)
-	set(HDK_LIB_DIR -L${HDSO})
+	set(HDK_INCLUDE_DIR $ENV{HT}/include/)
+	set(HDK_LIB_DIR $ENV{HDSO}/)
 
 	# compiler flags:
-	execute_process(COMMAND hcustom -c OUTPUT_VARIABLE HDK_DEFINITIONS)
+	execute_process(COMMAND hcustom -c 
+					OUTPUT_VARIABLE HDK_CXX_FLAGS
+					OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_STRIP_TRAILING_WHITESPACE)
 
+    # remove -c from a cxx:
+    string (REPLACE "-c" "" HDK_CXX_FLAGS ${HDK_CXX_FLAGS})
+
+	# linker flags:
+	execute_process(COMMAND hcustom -m 
+					OUTPUT_VARIABLE HDK_LINK_FLAGS
+					OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_STRIP_TRAILING_WHITESPACE)
+	
 	# Set variables:
-	set(HDK_LIBRARY_DIRS /usr/X11R6/lib64 /usr/X11R6/lib)
-	set(HDK_FRAMEWORK_DIRS )
-	set(HDK_FRAMEWORKS )
-	set(HDK_LIBRARIES GLU GL X11 Xext Xi dl)
-	set(HDK_HIH_DIR /home/symek/houdini12.0)
+	set(HDK_LIBRARIES HoudiniUT)
 
-	# OSX:
-	set(HDK_STANDALONE_FRAMEWORK_DIRS )
-	set(HDK_STANDALONE_FRAMEWORKS )
-	set(HDK_STANDALONE_LIBRARIES pthread HoudiniUI HoudiniOPZ HoudiniOP3 HoudiniOP2 HoudiniOP1 HoudiniSIM HoudiniGEO HoudiniPRM HoudiniUT GLU GL X11 Xext Xi dl)
-
-	message(STATUS "HDK found: ${HT}")
-	message(STATUS "HDK version: ${HOUDINI_VERSION}")
+	message(STATUS "HDK found: $ENV{HT}")
+	message(STATUS "HDK version: $ENV{HOUDINI_VERSION}")
 
 ELSE()
 
