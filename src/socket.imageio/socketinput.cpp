@@ -28,7 +28,7 @@
   (This is the Modified BSD License)
 */
 
-#include "imageio.h"
+#include "OpenImageIO/imageio.h"
 #include "socket_pvt.h"
 
 
@@ -38,6 +38,7 @@ OIIO_PLUGIN_NAMESPACE_BEGIN
 OIIO_PLUGIN_EXPORTS_BEGIN
 
     OIIO_EXPORT int socket_imageio_version = OIIO_PLUGIN_VERSION;
+    OIIO_EXPORT const char* socket_imageio_library_version() { return NULL; }
     OIIO_EXPORT ImageInput *socket_input_imageio_create () {
         return new SocketInput;
     }
@@ -113,6 +114,9 @@ SocketInput::read_native_scanline (int y, int z, void *data)
     } catch (boost::system::system_error &err) {
         error ("Error while reading: %s", err.what ());
         return false;
+    } catch (...) {
+        error ("Error while reading: unknown exception");
+        return false;
     }
 
     return true;
@@ -128,6 +132,9 @@ SocketInput::read_native_tile (int x, int y, int z, void *data)
                 m_spec.tile_bytes ()));
     } catch (boost::system::system_error &err) {
         error ("Error while reading: %s", err.what ());
+        return false;
+    } catch (...) {
+        error ("Error while reading: unknown exception");
         return false;
     }
 
@@ -161,11 +168,14 @@ SocketInput::accept_connection(const std::string &name)
     int port = atoi (rest_args["port"].c_str ());
 
     try {
-        acceptor = boost::shared_ptr <ip::tcp::acceptor>
+        acceptor = std::shared_ptr <ip::tcp::acceptor>
             (new ip::tcp::acceptor (io, ip::tcp::endpoint (ip::tcp::v4(), port)));
         acceptor->accept (socket);
     } catch (boost::system::system_error &err) {
         error ("Error while accepting: %s", err.what ());
+        return false;
+    } catch (...) {
+        error ("Error while accepting: unknown exception");
         return false;
     }
 
@@ -189,7 +199,10 @@ SocketInput::get_spec_from_client (ImageSpec &spec)
         spec.from_xml (spec_xml);
         delete [] spec_xml;
     } catch (boost::system::system_error &err) {
-        error ("Error while reading: %s", err.what ());
+        error ("Error while get_spec_from_client: %s", err.what ());
+        return false;
+    } catch (...) {
+        error ("Error while get_spec_from_client: unknown exception");
         return false;
     }
 

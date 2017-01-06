@@ -32,10 +32,7 @@
 #include <fstream>
 #include <vector>
 #include <map>
-
-#include <boost/bind.hpp>
-#include <boost/function.hpp>
-#include <boost/foreach.hpp>
+#include <functional>
 
 #include "psd_pvt.h"
 #include "jpeg_memory_src.h"
@@ -50,6 +47,10 @@ public:
     PSDInput ();
     virtual ~PSDInput () { close(); }
     virtual const char * format_name (void) const { return "psd"; }
+    virtual int supports (string_view feature) const {
+        return (feature == "exif"
+             || feature == "iptc");
+    }
     virtual bool open (const std::string &name, ImageSpec &newspec);
     virtual bool open (const std::string &name, ImageSpec &newspec,
                        const ImageSpec &config);
@@ -87,7 +88,7 @@ private:
     // into ImageSpec
     struct ResourceLoader {
         uint16_t resource_id;
-        boost::function<bool (PSDInput *, uint32_t)> load;
+        std::function<bool (PSDInput *, uint32_t)> load;
     };
 
     // Map image resource ID to image resource block
@@ -192,7 +193,7 @@ private:
     };
 
     std::string m_filename;
-    std::ifstream m_file;
+    OIIO::ifstream m_file;
     //Current subimage
     int m_subimage;
     //Subimage count (1 + layer count)
@@ -218,6 +219,11 @@ private:
     std::string m_rle_buffer;
     //Index of the transparent color, if any (for Indexed color mode only)
     int16_t m_transparency_index;
+    //Background color
+    double m_background_color[4];
+    ///< Do not convert unassociated alpha
+    bool m_keep_unassociated_alpha;
+
 
     FileHeader m_header;
     ColorModeData m_color_data;
@@ -249,6 +255,8 @@ private:
     bool load_resource_1005 (uint32_t length);
     //Alpha Channel Names
     bool load_resource_1006 (uint32_t length);
+    //Background Color
+    bool load_resource_1010 (uint32_t length);
     //JPEG thumbnail (Photoshop 4.0)
     bool load_resource_1033 (uint32_t length);
     //JPEG thumbnail (Photoshop 5.0)
@@ -312,6 +320,60 @@ private:
     //-Modify validate_header function to not reject that color mode
     //-Modify convert_to_rgb function to call <colormode>_to_rgb
 
+    // Convert from photoshop native alpha to
+    // associated/premultiplied
+    template <class T>
+    void removeBackground (T *data, int size, int nchannels, int alpha_channel, double *background) {
+        // RGB = CompRGB - (1 - alpha) * Background;
+        double scale = std::numeric_limits<T>::is_integer ?
+            1.0/std::numeric_limits<T>::max() : 1.0;
+
+        for ( ;  size;  --size, data += nchannels)
+            for (int c = 0;  c < nchannels;  c++)
+                if (c != alpha_channel) {
+                    double alpha = data[alpha_channel] * scale;
+                    double f = data[c];
+
+                    data[c] = T (f - (((1.0 - alpha) * background[c]) / scale));
+                }
+
+    }
+
+    template <class T>
+    void unassociateAlpha (T *data, int size, int nchannels, int alpha_channel, double *background) {
+        // RGB = (CompRGB - (1 - alpha) * Background) / alpha
+        double scale = std::numeric_limits<T>::is_integer ?
+            1.0/std::numeric_limits<T>::max() : 1.0;
+
+        for ( ;  size;  --size, data += nchannels)
+            for (int c = 0;  c < nchannels;  c++)
+                if (c != alpha_channel) {
+                    double alpha = data[alpha_channel] * scale;
+                    double f = data[c];
+
+                    if (alpha > 0.0)
+                        data[c] = T ((f - (((1.0 - alpha) * background[c]) / scale)) / alpha) ;
+                    else
+                        data[c] = 0;
+                }
+    }
+
+    template <class T>
+    void associateAlpha (T *data, int size, int nchannels, int alpha_channel) {
+        double scale = std::numeric_limits<T>::is_integer ?
+            1.0/std::numeric_limits<T>::max() : 1.0;
+        for ( ;  size;  --size, data += nchannels)
+            for (int c = 0;  c < nchannels;  c++)
+                if (c != alpha_channel) {
+                    double f = data[c];
+                    data[c] = T (f * (data[alpha_channel] * scale));
+                }
+    }
+
+    void background_to_assocalpha (int n, void *data);
+    void background_to_unassalpha (int n, void *data);
+    void unassalpha_to_assocalpha (int n, void *data);
+
     //Check if m_file is good. If not, set error message and return false.
     bool check_io ();
 
@@ -324,11 +386,8 @@ private:
         m_file.read ((char *)&buffer, sizeof(buffer));
         if (!bigendian ())
             swap_endian (&buffer);
-
-        // For debugging, numeric_cast will throw if precision is lost:
-        // value = boost::numeric_cast<TVariable>(buffer);
         value = buffer;
-        return m_file;
+        return m_file.good();
     }
 
     int read_pascal_string (std::string &s, uint16_t mod_padding);
@@ -390,11 +449,12 @@ private:
 // 1) Add ADD_LOADER(<ResourceID>) below
 // 2) Add a method in PSDInput:
 //    bool load_resource_<ResourceID> (uint32_t length);
-#define ADD_LOADER(id) {id, boost::bind (&PSDInput::load_resource_##id, _1, _2)}
+#define ADD_LOADER(id) {id, std::bind (&PSDInput::load_resource_##id, std::placeholders::_1, std::placeholders::_2)}
 const PSDInput::ResourceLoader PSDInput::resource_loaders[] =
 {
     ADD_LOADER(1005),
     ADD_LOADER(1006),
+    ADD_LOADER(1010),
     ADD_LOADER(1033),
     ADD_LOADER(1036),
     ADD_LOADER(1047),
@@ -458,6 +518,8 @@ OIIO_EXPORT ImageInput *psd_input_imageio_create () { return new PSDInput; }
 
 OIIO_EXPORT int psd_imageio_version = OIIO_PLUGIN_VERSION;
 
+OIIO_EXPORT const char* psd_imageio_library_version () { return NULL; }
+
 OIIO_EXPORT const char * psd_input_extensions[] = {
     "psd", "pdd", "psb", NULL
 };
@@ -477,12 +539,14 @@ bool
 PSDInput::open (const std::string &name, ImageSpec &newspec)
 {
     m_filename = name;
+
     Filesystem::open (m_file, name, std::ios::binary);
-    if (!m_file.is_open ()) {
+  
+    if (!m_file) {
         error ("\"%s\": failed to open file", name.c_str());
         return false;
     }
-
+    
     // File Header
     if (!load_header ())
         return false;
@@ -531,6 +595,10 @@ PSDInput::open (const std::string &name, ImageSpec &newspec,
                 const ImageSpec &config)
 {
     m_WantRaw = config.get_int_attribute ("psd:RawData", 0) != 0;
+
+    if (config.get_int_attribute("oiio:UnassociatedAlpha", 0) == 1)
+        m_keep_unassociated_alpha = true;
+
     return open (name, newspec);
 }
 
@@ -557,6 +625,66 @@ PSDInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
     m_subimage = subimage;
     newspec = m_spec = m_specs[subimage];
     return true;
+}
+
+
+
+void
+PSDInput::background_to_assocalpha (int n, void *data)
+{
+    switch (m_spec.format.basetype) {
+    case TypeDesc::UINT8:
+        removeBackground ((unsigned char *)data, n, m_spec.nchannels, m_spec.alpha_channel, m_background_color);
+        break;
+    case TypeDesc::UINT16:
+        removeBackground ((unsigned short *)data, n, m_spec.nchannels, m_spec.alpha_channel, m_background_color);
+        break;
+    case TypeDesc::UINT32:
+        removeBackground ((unsigned long *)data, n, m_spec.nchannels, m_spec.alpha_channel, m_background_color);
+        break;
+    default:
+        break;
+    }
+}
+
+
+
+void
+PSDInput::background_to_unassalpha (int n, void *data)
+{
+    switch (m_spec.format.basetype) {
+    case TypeDesc::UINT8:
+        unassociateAlpha ((unsigned char *)data, n, m_spec.nchannels, m_spec.alpha_channel, m_background_color);
+        break;
+    case TypeDesc::UINT16:
+        unassociateAlpha ((unsigned short *)data, n, m_spec.nchannels, m_spec.alpha_channel, m_background_color);
+        break;
+    case TypeDesc::UINT32:
+        unassociateAlpha ((unsigned long *)data, n, m_spec.nchannels, m_spec.alpha_channel, m_background_color);
+        break;
+    default:
+        break;
+    }
+}
+
+
+
+void
+PSDInput::unassalpha_to_assocalpha (int n, void *data)
+{
+    switch (m_spec.format.basetype) {
+    case TypeDesc::UINT8:
+        associateAlpha ((unsigned char *)data, n, m_spec.nchannels, m_spec.alpha_channel);
+        break;
+    case TypeDesc::UINT16:
+        associateAlpha ((unsigned short *)data, n, m_spec.nchannels, m_spec.alpha_channel);
+        break;
+    case TypeDesc::UINT32:
+        associateAlpha ((unsigned long *)data, n, m_spec.nchannels, m_spec.alpha_channel);
+        break;
+    default:
+        break;
+    }
 }
 
 
@@ -588,6 +716,38 @@ PSDInput::read_native_scanline (int y, int z, void *data)
         if (!convert_to_rgb (dst))
             return false;
     }
+
+    // PSD specifically dictates unassociated (un-"premultiplied") alpha.
+    // Convert to associated unless we were requested not to do so.
+    //
+    // Composite layer (subimage 0) is mixed with background, which
+    // affects the alpha (aka white borders if background not removed).
+    //
+    // Composite:
+    // m_keep_unassociated_alpha true: remove background and convert to unassociated
+    // m_keep_unassociated_alpha false: remove background only
+    //
+    // Other Layers:
+    // m_keep_unassociated_alpha true: do nothing
+    // m_keep_unassociated_alpha false: convert to associated
+    //
+    //
+    if (m_spec.alpha_channel != -1) {
+        if (m_subimage == 0) {
+            if (m_keep_unassociated_alpha) {
+                background_to_unassalpha (m_spec.width, data);
+            } else {
+                background_to_assocalpha (m_spec.width, data);
+            }
+        } else {
+            if (m_keep_unassociated_alpha) {
+                // do nothing - leave as it is
+            } else {
+                unassalpha_to_assocalpha (m_spec.width, data);
+            }
+        }
+    }
+
     return true;
 }
 
@@ -597,7 +757,7 @@ void
 PSDInput::init ()
 {
     m_filename.clear ();
-    m_file.close ();
+    m_file.close();
     m_subimage = -1;
     m_subimage_count = 0;
     m_specs.clear ();
@@ -610,6 +770,11 @@ PSDInput::init ()
     m_channel_buffers.clear ();
     m_rle_buffer.clear ();
     m_transparency_index = -1;
+    m_keep_unassociated_alpha = false;
+    m_background_color[0] = 1.0;
+    m_background_color[1] = 1.0;
+    m_background_color[2] = 1.0;
+    m_background_color[3] = 1.0;
 }
 
 
@@ -817,7 +982,7 @@ PSDInput::handle_resources (ImageResourceMap &resources)
 {
     // Loop through each of our resource loaders
     const ImageResourceMap::const_iterator end (resources.end ());
-    BOOST_FOREACH (const ResourceLoader &loader, resource_loaders) {
+    for (const ResourceLoader &loader : resource_loaders) {
         ImageResourceMap::const_iterator it (resources.find (loader.resource_id));
         // If a resource with that ID exists in the file, call the loader
         if (it != end) {
@@ -896,6 +1061,26 @@ PSDInput::load_resource_1006 (uint32_t length)
 
 
 bool
+PSDInput::load_resource_1010 (uint32_t length)
+{
+    const double int8_to_dbl = 1.0 / 0xFF;
+    int8_t color_id;
+    int32_t color;
+
+    read_bige<int8_t> (color_id);
+    read_bige<int32_t> (color);
+
+    m_background_color[0] = ((color) & 0xFF) * int8_to_dbl;
+    m_background_color[1] = ((color >> 8) & 0xFF) * int8_to_dbl;
+    m_background_color[2] = ((color >> 16) & 0xFF) * int8_to_dbl;
+    m_background_color[3] = ((color >> 24) & 0xFF) * int8_to_dbl;
+
+    return true;
+}
+
+
+
+bool
 PSDInput::load_resource_1033 (uint32_t length)
 {
     return load_resource_thumbnail (length, true);
@@ -931,8 +1116,8 @@ PSDInput::load_resource_1058 (uint32_t length)
     if (!m_file.read (&data[0], length))
         return false;
 
-    if (!decode_exif (&data[0], length, m_composite_attribs) ||
-        !decode_exif (&data[0], length, m_common_attribs)) {
+    if (!decode_exif (data, m_composite_attribs) ||
+        !decode_exif (data, m_common_attribs)) {
         error ("Failed to decode Exif data");
         return false;
     }
@@ -1345,8 +1530,20 @@ PSDInput::read_rle_lengths (uint32_t height, std::vector<uint32_t> &rle_lengths)
 bool
 PSDInput::load_global_mask_info ()
 {
+    if (!m_layer_mask_info.length)
+        return true;
+
     m_file.seekg (m_layer_mask_info.layer_info.end);
+    uint64_t remaining = m_layer_mask_info.end - m_file.tellg();
     uint32_t length;
+
+    // This section should be at least 17 bytes, but some files lack
+    // global mask info and additional layer info, not convered in the spec
+    if (remaining < 17) {
+        m_file.seekg(m_layer_mask_info.end);
+        return true;
+    }
+
     read_bige<uint32_t> (length);
     std::streampos start = m_file.tellg ();
     std::streampos end = start + (std::streampos)length;
@@ -1372,6 +1569,9 @@ PSDInput::load_global_mask_info ()
 bool
 PSDInput::load_global_additional ()
 {
+    if (!m_layer_mask_info.length)
+        return true;
+
     char signature[4];
     char key[4];
     uint64_t length;
@@ -1381,7 +1581,8 @@ PSDInput::load_global_additional ()
         if (!check_io ())
             return false;
 
-        if (std::memcmp (signature, "8BIM", 4) != 0) {
+        // the spec supports 8BIM, and 8B64 (presumably for psb support)
+        if (std::memcmp (signature, "8BIM", 4) != 0 && std::memcmp (signature, "8B64", 4) != 0) {
             error ("[Global Additional Layer Info] invalid signature");
             return false;
         }
@@ -1406,6 +1607,8 @@ PSDInput::load_global_additional ()
         // skip it for now
         m_file.seekg (length, std::ios::cur);
     }
+    // finished with the layer and mask information section, seek to the end
+    m_file.seekg (m_layer_mask_info.end);
     return check_io ();
 }
 
@@ -1428,7 +1631,7 @@ PSDInput::load_image_data ()
     m_image_data.channel_info.resize (m_header.channel_count);
     // setup some generic properties and read any RLE lengths
     // Image Data Section has RLE lengths for all channels stored first
-    BOOST_FOREACH (ChannelInfo &channel_info, m_image_data.channel_info) {
+    for (ChannelInfo &channel_info : m_image_data.channel_info) {
         channel_info.compression = compression;
         channel_info.channel_id = id++;
         channel_info.data_length = row_length * m_header.height;
@@ -1437,7 +1640,7 @@ PSDInput::load_image_data ()
                 return false;
         }
     }
-    BOOST_FOREACH (ChannelInfo &channel_info, m_image_data.channel_info) {
+    for (ChannelInfo &channel_info : m_image_data.channel_info) {
         channel_info.row_pos.resize (m_header.height);
         channel_info.data_pos = m_file.tellg ();
         channel_info.row_length = (m_header.width * m_header.depth + 7) / 8;
@@ -1490,7 +1693,7 @@ PSDInput::setup ()
     for (int i = 0; i < raw_channel_count; ++i)
         m_channels[0].push_back (&m_image_data.channel_info[i]);
 
-    BOOST_FOREACH (Layer &layer, m_layers) {
+    for (Layer &layer : m_layers) {
         spec_channel_count = m_WantRaw ? mode_channel_count[m_header.color_mode] : 3;
         raw_channel_count = mode_channel_count[m_header.color_mode];
         bool transparency = (bool)layer.channel_id_map.count (ChannelID_Transparency);
@@ -1514,6 +1717,10 @@ PSDInput::setup ()
         if (transparency)
             channels.push_back (layer.channel_id_map[ChannelID_Transparency]);
     }
+
+    if (m_spec.alpha_channel != -1)
+        if (m_keep_unassociated_alpha)
+            m_spec.attribute ("oiio:UnassociatedAlpha", 1);
 }
 
 

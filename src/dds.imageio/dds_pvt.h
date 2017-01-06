@@ -31,8 +31,8 @@
 #ifndef OPENIMAGEIO_DDS_PVT_H
 #define OPENIMAGEIO_DDS_PVT_H
 
-#include "filesystem.h"
-#include "fmath.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/fmath.h"
 
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
@@ -131,7 +131,7 @@ typedef struct {
 } dds_header;
 
 
-};  // namespace DDS_pvt
+}  // namespace DDS_pvt
 
 
 OIIO_PLUGIN_NAMESPACE_END

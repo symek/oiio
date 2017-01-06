@@ -37,14 +37,11 @@
 #include <vector>
 #include <string>
 
-#include <boost/tokenizer.hpp>
-#include <boost/foreach.hpp>
-#include <boost/filesystem.hpp>
-
-#include "argparse.h"
-#include "imageio.h"
-#include "sysutil.h"
-#include "filesystem.h"
+#include "OpenImageIO/argparse.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/sysutil.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/imagecache.h"
 
 
 OIIO_NAMESPACE_USING;
@@ -179,40 +176,6 @@ DateTime_to_time_t (const char *datetime, time_t &timet)
 
 
 
-// Utility: split semicolon-separated list
-static void
-split_list (const std::string &list, std::vector<std::string> &items)
-{
-    typedef boost::tokenizer<boost::char_separator<char> > tokenizer;
-    boost::char_separator<char> sep(";");
-    tokenizer tokens (list, sep);
-    for (tokenizer::iterator tok_iter = tokens.begin();
-         tok_iter != tokens.end(); ++tok_iter) {
-        std::string t = *tok_iter;
-        while (t.length() && t[0] == ' ')
-            t.erase (t.begin());
-        if (t.length())
-            items.push_back (t);
-    }
-}
-
-
-
-// Utility: join list into a single semicolon-separated string
-static std::string
-join_list (const std::vector<std::string> &items)
-{
-    std::string s;
-    for (size_t i = 0;  i < items.size();  ++i) {
-        if (i > 0)
-            s += "; ";
-        s += items[i];
-    }
-    return s;
-}
-
-
-
 // Adjust the output spec based on the command-line arguments.
 // Return whether the specifics preclude using copy_image.
 static bool
@@ -222,12 +185,12 @@ adjust_spec (ImageInput *in, ImageOutput *out,
     bool nocopy = no_copy_image;
 
     // Copy the spec, with possible change in format
-    outspec.set_format (inspec.format);
+    outspec.format = inspec.format;
     if (inspec.channelformats.size()) {
         // Input file has mixed channels
         if (out->supports("channelformats")) {
             // Output supports mixed formats -- so request it
-            outspec.set_format (TypeDesc::UNKNOWN);
+            outspec.format = TypeDesc::UNKNOWN;
         } else {
             // Input had mixed formats, output did not, so just use a fixed
             // format and forget the per-channel formats for output.
@@ -332,16 +295,19 @@ adjust_spec (ImageInput *in, ImageOutput *out,
     if (keywords.size()) {
         std::string oldkw = outspec.get_string_attribute ("Keywords");
         std::vector<std::string> oldkwlist;
-        if (! oldkw.empty())
-            split_list (oldkw, oldkwlist);
-        BOOST_FOREACH (const std::string &nk, keywords) {
+        if (! oldkw.empty()) {
+            Strutil::split (oldkw, oldkwlist, ";");
+            for (size_t i = 0; i < oldkwlist.size(); ++i)
+                oldkwlist[i] = Strutil::strip (oldkwlist[i]);
+        }
+        for (auto&& nk : keywords) {
             bool dup = false;
-            BOOST_FOREACH (const std::string &ok, oldkwlist)
+            for (auto&& ok : oldkwlist)
                 dup |= (ok == nk);
             if (! dup)
                 oldkwlist.push_back (nk);
         }
-        outspec.attribute ("Keywords", join_list (oldkwlist));
+        outspec.attribute ("Keywords", Strutil::join (oldkwlist, "; "));
     }
 
     for (size_t i = 0;  i < attribnames.size();  ++i) {
@@ -394,6 +360,27 @@ convert_file (const std::string &in_filename, const std::string &out_filename)
         return false;
     }
 
+    // In order to deal with formats that support subimages, but not
+    // subimage appending, we gather them all first.
+    std::vector<ImageSpec> subimagespecs;
+    if (out->supports("multiimage") && !out->supports("appendsubimage")) {
+        ImageCache *imagecache = ImageCache::create ();
+        int nsubimages = 0;
+        ustring ufilename (in_filename);
+        imagecache->get_image_info (ufilename, 0, 0, ustring("subimages"),
+                                    TypeDesc::TypeInt, &nsubimages);
+        if (nsubimages > 1) {
+            subimagespecs.resize (nsubimages);
+            for (int i = 0;  i < nsubimages;  ++i) {
+                ImageSpec inspec = *imagecache->imagespec (ufilename, i, 0,
+                                                           true /*native*/);
+                subimagespecs[i] = inspec;
+                adjust_spec (in, out, inspec, subimagespecs[i]);
+            }
+        }
+        ImageCache::destroy (imagecache);
+    }
+
     bool ok = true;
     bool mip_to_subimage_warning = false;
     for (int subimage = 0;
@@ -413,11 +400,13 @@ convert_file (const std::string &in_filename, const std::string &out_filename)
             ImageSpec outspec = inspec;
             bool nocopy = adjust_spec (in, out, inspec, outspec);
         
-            ImageOutput::OpenMode mode;
             if (miplevel > 0) {
+                // Moving to next MIP level
+                ImageOutput::OpenMode mode;
                 if (out->supports ("mipmap"))
                     mode = ImageOutput::AppendMIPLevel;
-                else if (out->supports ("multiimage")) {
+                else if (out->supports ("multiimage") &&
+                         out->supports ("appendsubimage")) {
                     mode = ImageOutput::AppendSubimage; // use if we must
                     if (! mip_to_subimage_warning
                         && strcmp(out->format_name(),"tiff")) {
@@ -432,14 +421,21 @@ convert_file (const std::string &in_filename, const std::string &out_filename)
                     std::cerr << "\tOnly the first level has been copied.\n";
                     break;  // on to the next subimage
                 }
+                ok = out->open (tempname.c_str(), outspec, mode);
+            } else if (subimage > 0) {
+                // Moving to next subimage
+                ok = out->open (tempname.c_str(), outspec,
+                                ImageOutput::AppendSubimage);
+            } else {
+                // First time opening
+                if (subimagespecs.size())
+                    ok = out->open (tempname.c_str(), int(subimagespecs.size()),
+                                    &subimagespecs[0]);
+                else
+                    ok = out->open (tempname.c_str(), outspec, ImageOutput::Create);
             }
-            else if (subimage > 0)
-                mode = ImageOutput::AppendSubimage;
-            else
-                mode = ImageOutput::Create;
-
-            if (! out->open (tempname.c_str(), outspec, mode)) {
-                std::string err = geterror();
+            if (! ok) {
+                std::string err = out->geterror();
                 std::cerr << "iconvert ERROR: " 
                           << (err.length() ? err : Strutil::format("Could not open \"%s\"", out_filename))
                           << "\n";
@@ -487,11 +483,11 @@ convert_file (const std::string &in_filename, const std::string &out_filename)
 
     if (out_filename != tempname) {
         if (ok) {
-            boost::filesystem::remove (out_filename);
-            boost::filesystem::rename (tempname, out_filename);
+            Filesystem::remove (out_filename);
+            Filesystem::rename (tempname, out_filename);
         }
         else
-            boost::filesystem::remove (tempname);
+            Filesystem::remove (tempname);
     }
 
     // If user requested, try to adjust the file's modification time to
@@ -507,6 +503,7 @@ convert_file (const std::string &in_filename, const std::string &out_filename)
 int
 main (int argc, char *argv[])
 {
+    Filesystem::convert_native_arguments (argc, (const char **)argv);
     getargs (argc, argv);
 
     OIIO::attribute ("threads", nthreads);
@@ -514,7 +511,7 @@ main (int argc, char *argv[])
     bool ok = true;
 
     if (inplace) {
-        BOOST_FOREACH (const std::string &s, filenames)
+        for (auto&& s : filenames)
             ok &= convert_file (s, s);
     } else {
         ok = convert_file (filenames[0], filenames[1]);

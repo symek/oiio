@@ -31,15 +31,15 @@
 
 #include <iostream>
 
-#include <QtGui/QKeyEvent>
-#include <QtGui/QLabel>
-#include <QtGui/QPushButton>
-#include <QtGui/QSpinBox>
-#include <QtGui/QVBoxLayout>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QPushButton>
+#include <QSpinBox>
+#include <QVBoxLayout>
 
 #include "imageviewer.h"
-#include "dassert.h"
-#include "strutil.h"
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/strutil.h"
 
 
 

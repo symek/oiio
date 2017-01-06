@@ -1,14 +1,17 @@
 #include <stdio.h>      /* defines printf for tests */
 #include <time.h>       /* defines time_t for timings in the test */
-#include <stdint.h>     /* defines uint32_t etc */
-#include <sys/param.h>  /* attempt to define endianness */
-#ifdef linux
+#if defined(__linux__) || defined(__APPLE__)
+# include <sys/param.h>  /* attempt to define endianness */
+#endif
+#ifdef __linux__
 # include <endian.h>    /* attempt to define endianness */
 #endif
 
-#include "hash.h"
+#include "OpenImageIO/platform.h"
+#include "OpenImageIO/fmath.h"
+#include "OpenImageIO/hash.h"
 
-OIIO_NAMESPACE_ENTER {
+OIIO_NAMESPACE_BEGIN
 
 
 namespace xxhash {
@@ -57,8 +60,9 @@ namespace xxhash {
 #define inline __forceinline // Visual is not C99, but supports some kind of inline
 #endif
 
-// GCC does not support _rotl outside of Windows
-#if !defined(_WIN32)
+// Check for support of _rotl 
+// Not required for GCC 4.9x with -std=c++11
+#ifndef _rotl
 #define _rotl(x,r) ((x << r) | (x >> (32 - r)))
 #endif
 
@@ -114,98 +118,6 @@ inline unsigned int XXH_small(const void* key, int len, unsigned int seed)
         return crc;
 }
 
-
-
-//******************************
-// Hash functions
-//******************************
-unsigned int XXH_fast32(const void* input, int len, unsigned int seed)
-{
-        // Special case, for small inputs
-        if (len < 16) return XXH_small(input, len, seed);
-
-        {
-                const unsigned char* p = (const unsigned char*)input;
-                const unsigned char* const bEnd = p + len;
-                unsigned int v1 = seed + PRIME1;
-                unsigned int v2 = v1 * PRIME2 + len;
-                unsigned int v3 = v2 * PRIME3;
-                unsigned int v4 = v3 * PRIME4;  
-                const unsigned char* const limit = bEnd - 16;
-                unsigned int crc;
-
-                while (p<limit)
-                {
-                        v1 = _rotl(v1, 13) + (*(unsigned int*)p); p+=4;
-                        v2 = _rotl(v2, 11) + (*(unsigned int*)p); p+=4;
-                        v3 = _rotl(v3, 17) + (*(unsigned int*)p); p+=4;
-                        v4 = _rotl(v4, 19) + (*(unsigned int*)p); p+=4;
-                } 
-
-                p = bEnd - 16;
-                v1 += _rotl(v1, 17); v2 += _rotl(v2, 19); v3 += _rotl(v3, 13); v4 += _rotl(v4, 11); 
-                v1 *= PRIME1; v2 *= PRIME1; v3 *= PRIME1; v4 *= PRIME1; 
-                v1 += *(unsigned int*)p; p+=4; v2 += *(unsigned int*)p; p+=4; v3 += *(unsigned int*)p; p+=4; v4 += *(unsigned int*)p;   // p+=4;
-                v1 *= PRIME2; v2 *= PRIME2; v3 *= PRIME2; v4 *= PRIME2; 
-                v1 += _rotl(v1, 11); v2 += _rotl(v2, 17); v3 += _rotl(v3, 19); v4 += _rotl(v4, 13); 
-                v1 *= PRIME3; v2 *= PRIME3; v3 *= PRIME3; v4 *= PRIME3;
-
-                crc = v1 + _rotl(v2, 3) + _rotl(v3, 6) + _rotl(v4, 9);
-                crc ^= crc >> 11;
-                crc += (PRIME4+len) * PRIME1;
-                crc ^= crc >> 15;
-                crc *= PRIME2;
-                crc ^= crc >> 13;
-
-                return crc;
-        }
-
-}
-
-
-
-unsigned int XXH_strong32(const void* input, int len, unsigned int seed)
-{
-        // Special case, for small inputs
-        if (len < 16) return XXH_small(input, len, seed);
-
-        {
-                const unsigned char* p = (const unsigned char*)input;
-                const unsigned char* const bEnd = p + len;
-                unsigned int v1 = seed + PRIME1;
-                unsigned int v2 = v1 * PRIME2 + len;
-                unsigned int v3 = v2 * PRIME3;
-                unsigned int v4 = v3 * PRIME4;  
-                const unsigned char* const limit = bEnd - 16;
-                unsigned int crc;
-
-                while (p<limit)
-                {
-                        v1 += _rotl(v1, 13); v1 *= PRIME1; v1 += (*(unsigned int*)p); p+=4;
-                        v2 += _rotl(v2, 11); v2 *= PRIME1; v2 += (*(unsigned int*)p); p+=4;
-                        v3 += _rotl(v3, 17); v3 *= PRIME1; v3 += (*(unsigned int*)p); p+=4;
-                        v4 += _rotl(v4, 19); v4 *= PRIME1; v4 += (*(unsigned int*)p); p+=4;
-                } 
-
-                p = bEnd - 16;
-                v1 += _rotl(v1, 17); v2 += _rotl(v2, 19); v3 += _rotl(v3, 13); v4 += _rotl(v4, 11); 
-                v1 *= PRIME1; v2 *= PRIME1; v3 *= PRIME1; v4 *= PRIME1; 
-                v1 += *(unsigned int*)p; p+=4; v2 += *(unsigned int*)p; p+=4; v3 += *(unsigned int*)p; p+=4; v4 += *(unsigned int*)p;   // p+=4;
-                v1 *= PRIME2; v2 *= PRIME2; v3 *= PRIME2; v4 *= PRIME2; 
-                v1 += _rotl(v1, 11); v2 += _rotl(v2, 17); v3 += _rotl(v3, 19); v4 += _rotl(v4, 13); 
-                v1 *= PRIME3; v2 *= PRIME3; v3 *= PRIME3; v4 *= PRIME3;
-
-                crc = v1 + _rotl(v2, 3) + _rotl(v3, 6) + _rotl(v4, 9);
-                crc ^= crc >> 11;
-                crc += (PRIME4+len) * PRIME1;
-                crc ^= crc >> 15;
-                crc *= PRIME2;
-                crc ^= crc >> 13;
-
-                return crc;
-        }
-
-}
 
 } // end namespace xxhash
 
@@ -974,4 +886,4 @@ uint32_t hashbig( const void *key, size_t length, uint32_t initval)
 } // end namespace bjhash
 
 
-} OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END

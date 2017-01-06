@@ -37,9 +37,10 @@
 #ifndef OPENIMAGEIO_SOCKET_PVT_H
 #define OPENIMAGEIO_SOCKET_PVT_H
 
-#include "imageio.h"
-
 #include <map>
+#include <memory>
+#include "OpenImageIO/imageio.h"
+
 
 // The boost::asio library uses functionality only available since Windows XP,
 // thus _WIN32_WINNT must be set to _WIN32_WINNT_WINXP (0x0501) or greater.
@@ -50,7 +51,6 @@
 #endif
 
 #include <boost/asio.hpp>
-#include <boost/shared_ptr.hpp>
 
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
@@ -64,7 +64,7 @@ class SocketOutput : public ImageOutput {
     SocketOutput ();
     virtual ~SocketOutput () { close(); }
     virtual const char * format_name (void) const { return "socket"; }
-    virtual bool supports (const std::string &property) const { return false; }
+    virtual int supports (string_view property) const;
     virtual bool open (const std::string &name, const ImageSpec &spec,
                        OpenMode mode=Create);
     virtual bool write_scanline (int y, int z, TypeDesc format,
@@ -104,7 +104,7 @@ class SocketInput : public ImageInput {
     int m_next_scanline;      // Which scanline is the next to read?
     io_service io;
     ip::tcp::socket socket;
-    boost::shared_ptr <ip::tcp::acceptor> acceptor;
+    std::shared_ptr <ip::tcp::acceptor> acceptor;
     
     bool accept_connection (const std::string &name);
     bool get_spec_from_client (ImageSpec &spec);

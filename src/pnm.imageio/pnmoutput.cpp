@@ -30,8 +30,8 @@
 
 #include <fstream>
 
-#include "filesystem.h"
-#include "imageio.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/imageio.h"
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
 
@@ -40,20 +40,22 @@ class PNMOutput : public ImageOutput {
 public:
     virtual ~PNMOutput ();
     virtual const char * format_name (void) const { return "pnm"; }
-    virtual bool supports (const std::string &feature) const {
-        // Support nothing nonstandard
-        return false;
-    }
     virtual bool open (const std::string &name, const ImageSpec &spec,
                        OpenMode mode=Create);
     virtual bool close ();
     virtual bool write_scanline (int y, int z, TypeDesc format,
                                  const void *data, stride_t xstride);
+    virtual bool write_tile (int x, int y, int z, TypeDesc format,
+                             const void *data, stride_t xstride,
+                             stride_t ystride, stride_t zstride);
 
 private:
     std::string m_filename;           ///< Stash the filename
-    std::ofstream m_file;
+    OIIO::ofstream m_file;
     unsigned int m_max_val, m_pnm_type;
+    unsigned int m_dither;
+    std::vector<unsigned char> m_scratch;
+    std::vector<unsigned char> m_tilebuffer;
 };
 
 
@@ -164,8 +166,16 @@ PNMOutput::open (const std::string &name, const ImageSpec &userspec,
 
     close ();  // Close any already-opened file
     m_spec = userspec;  // Stash the spec
-
+    m_spec.set_format (TypeDesc::UINT8);  // Force 8 bit output
     int bits_per_sample = m_spec.get_int_attribute ("oiio:BitsPerSample", 8);
+    m_dither = (m_spec.format == TypeDesc::UINT8) ?
+                    m_spec.get_int_attribute ("oiio:dither", 0) : 0;
+
+    if (m_spec.nchannels != 1 && m_spec.nchannels != 3) {
+        error ("%s does not support %d-channel images\n",
+               format_name(), m_spec.nchannels);
+        return false;
+    }
 
     if (bits_per_sample == 1)
         m_pnm_type = 4;
@@ -177,12 +187,15 @@ PNMOutput::open (const std::string &name, const ImageSpec &userspec,
     {
         m_pnm_type -= 3;
         Filesystem::open (m_file, name);
+        
     }
-    else
+    else {
         Filesystem::open (m_file, name, std::ios::out|std::ios::binary);
-
-    if (!m_file.is_open())
-       return false;
+ 
+    }
+    
+    if (!m_file)
+        return false;
 
     m_max_val = (1 << bits_per_sample) - 1;
     // Write header
@@ -190,6 +203,11 @@ PNMOutput::open (const std::string &name, const ImageSpec &userspec,
     m_file << m_spec.width << " " << m_spec.height << std::endl;
     if (m_pnm_type != 1 && m_pnm_type != 4)  // only non-monochrome 
         m_file << m_max_val << std::endl;
+
+    // If user asked for tiles -- which this format doesn't support, emulate
+    // it by buffering the whole image.
+    if (m_spec.tile_width && m_spec.tile_height)
+        m_tilebuffer.resize (m_spec.image_bytes());
 
     return m_file.good();
 }
@@ -199,6 +217,19 @@ PNMOutput::open (const std::string &name, const ImageSpec &userspec,
 bool
 PNMOutput::close ()
 {
+    if (!m_file) {   // already closed
+        return true;
+    }
+
+    bool ok = true;
+    if (m_spec.tile_width) {
+        // Handle tile emulation -- output the buffered pixels
+        ASSERT (m_tilebuffer.size());
+        ok &= write_scanlines (m_spec.y, m_spec.y+m_spec.height, 0,
+                               m_spec.format, &m_tilebuffer[0]);
+        std::vector<unsigned char>().swap (m_tilebuffer);
+    }
+
     m_file.close();
     return true;  
 }
@@ -209,10 +240,18 @@ bool
 PNMOutput::write_scanline (int y, int z, TypeDesc format,
         const void *data, stride_t xstride)
 {
-    if (!m_file.is_open())
+    if (!m_file)
         return false;
     if (z)
         return false;
+
+    m_spec.auto_stride (xstride, format, spec().nchannels);
+    const void *origdata = data;
+    data = to_native_scanline (format, data, xstride, m_scratch,
+                               m_dither, y, z);
+    if (data != origdata) // a conversion happened...
+        xstride = spec().nchannels;
+
     switch (m_pnm_type){
         case 1:
             write_ascii_binary (m_file, (unsigned char *) data, xstride, m_spec);
@@ -240,6 +279,19 @@ PNMOutput::write_scanline (int y, int z, TypeDesc format,
 
     return m_file.good();
 }
+
+
+
+bool
+PNMOutput::write_tile (int x, int y, int z, TypeDesc format,
+                       const void *data, stride_t xstride,
+                       stride_t ystride, stride_t zstride)
+{
+    // Emulate tiles by buffering the whole image
+    return copy_tile_to_image_buffer (x, y, z, format, data, xstride,
+                                      ystride, zstride, &m_tilebuffer[0]);
+}
+
 
 OIIO_PLUGIN_NAMESPACE_END
 

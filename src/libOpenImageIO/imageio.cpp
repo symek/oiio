@@ -34,37 +34,73 @@
 #include <OpenEXR/half.h>
 #include <OpenEXR/ImathFun.h>
 
-#include <boost/scoped_array.hpp>
+#include <boost/thread/tss.hpp>
 
-#include "dassert.h"
-#include "typedesc.h"
-#include "strutil.h"
-#include "fmath.h"
-
-#include "imageio.h"
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/typedesc.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/sysutil.h"
+#include "OpenImageIO/fmath.h"
+#include "OpenImageIO/thread.h"
+#include "OpenImageIO/parallel.h"
+#include "OpenImageIO/hash.h"
+#include "OpenImageIO/imageio.h"
 #include "imageio_pvt.h"
 
-OIIO_NAMESPACE_ENTER
+OIIO_NAMESPACE_BEGIN
+
+static int
+threads_default ()
 {
+    int n = Strutil::from_string<int>(Sysutil::getenv("OPENIMAGEIO_THREADS"));
+    if (n < 1)
+        n = Sysutil::hardware_concurrency();
+    return n;
+}
 
 // Global private data
 namespace pvt {
 recursive_mutex imageio_mutex;
-int oiio_threads = boost::thread::hardware_concurrency();
-ustring plugin_searchpath;
+thread_pool *oiio_thread_pool = default_thread_pool();
+atomic_int oiio_threads (threads_default());
+atomic_int oiio_exr_threads (threads_default());
+atomic_int oiio_read_chunk (256);
+int tiff_half (0);
+ustring plugin_searchpath (OIIO_DEFAULT_PLUGIN_SEARCHPATH);
 std::string format_list;   // comma-separated list of all formats
+std::string extension_list;   // list of all extensions for all formats
+std::string library_list;   // list of all libraries for all formats
+}
+
+using namespace pvt;
+
+
+namespace {
+// Hidden global OIIO data.
+static spin_mutex attrib_mutex;
+static const int maxthreads = 256;   // reasonable maximum for sanity check
+static const char *oiio_debug_env = getenv("OPENIMAGEIO_DEBUG");
+static FILE *oiio_debug_file = NULL;
+#ifdef NDEBUG
+int print_debug (oiio_debug_env ? atoi(oiio_debug_env) : 0);
+#else
+int print_debug (oiio_debug_env ? atoi(oiio_debug_env) : 1);
+#endif
 };
 
 
 
-using namespace pvt;
+int
+openimageio_version ()
+{
+    return OIIO_VERSION;
+}
 
-namespace {
 
 
 // To avoid thread oddities, we have the storage area buffering error
 // messages for seterror()/geterror() be thread-specific.
-static thread_specific_ptr<std::string> thread_error_msg;
+static boost::thread_specific_ptr<std::string> thread_error_msg;
 
 // Return a reference to the string for this thread's error messages,
 // creating it if none exists for this thread thus far.
@@ -79,16 +115,6 @@ error_msg ()
     return *e;
 }
 
-} // end anon namespace
-
-
-
-
-int
-openimageio_version ()
-{
-    return OIIO_VERSION;
-}
 
 
 
@@ -97,7 +123,6 @@ openimageio_version ()
 void
 pvt::seterror (const std::string& message)
 {
-    recursive_lock_guard lock (pvt::imageio_mutex);
     error_msg() = message;
 }
 
@@ -106,7 +131,6 @@ pvt::seterror (const std::string& message)
 std::string
 geterror ()
 {
-    recursive_lock_guard lock (pvt::imageio_mutex);
     std::string e = error_msg();
     error_msg().clear ();
     return e;
@@ -114,30 +138,52 @@ geterror ()
 
 
 
-namespace {
-
-// Private global OIIO data.
-
-static spin_mutex attrib_mutex;
-static const int maxthreads = 64;   // reasonable maximum for sanity check
-
-};
+void
+debug (string_view message)
+{
+    recursive_lock_guard lock (pvt::imageio_mutex);
+    if (print_debug) {
+        if (! oiio_debug_file) {
+            const char *filename = getenv("OPENIMAGEIO_DEBUG_FILE");
+            oiio_debug_file = filename && filename[0] ? fopen(filename,"a") : stderr;
+            ASSERT (oiio_debug_file);
+        }
+        Strutil::fprintf (oiio_debug_file, "OIIO DEBUG: %s", message);
+    }
+}
 
 
 
 bool
-attribute (const std::string &name, TypeDesc type, const void *val)
+attribute (string_view name, TypeDesc type, const void *val)
 {
-    spin_lock lock (attrib_mutex);
     if (name == "threads" && type == TypeDesc::TypeInt) {
-        oiio_threads = Imath::clamp (*(const int *)val, 0, maxthreads);
-        if (oiio_threads == 0) {
-            oiio_threads = boost::thread::hardware_concurrency();
-        }
+        int ot = Imath::clamp (*(const int *)val, 0, maxthreads);
+        if (ot == 0)
+            ot = threads_default();
+        oiio_threads = ot;
+        oiio_thread_pool->resize (ot-1);
+        return true;
+    }
+    spin_lock lock (attrib_mutex);
+    if (name == "read_chunk" && type == TypeDesc::TypeInt) {
+        oiio_read_chunk = *(const int *)val;
         return true;
     }
     if (name == "plugin_searchpath" && type == TypeDesc::TypeString) {
         plugin_searchpath = ustring (*(const char **)val);
+        return true;
+    }
+    if (name == "exr_threads" && type == TypeDesc::TypeInt) {
+        oiio_exr_threads = Imath::clamp (*(const int *)val, -1, maxthreads);
+        return true;
+    }
+    if (name == "tiff:half" && type == TypeDesc::TypeInt) {
+        tiff_half = *(const int *)val;
+        return true;
+    }
+    if (name == "debug" && type == TypeDesc::TypeInt) {
+        print_debug = *(const int *)val;
         return true;
     }
     return false;
@@ -146,11 +192,15 @@ attribute (const std::string &name, TypeDesc type, const void *val)
 
 
 bool
-getattribute (const std::string &name, TypeDesc type, void *val)
+getattribute (string_view name, TypeDesc type, void *val)
 {
-    spin_lock lock (attrib_mutex);
     if (name == "threads" && type == TypeDesc::TypeInt) {
         *(int *)val = oiio_threads;
+        return true;
+    }
+    spin_lock lock (attrib_mutex);
+    if (name == "read_chunk" && type == TypeDesc::TypeInt) {
+        *(int *)val = oiio_read_chunk;
         return true;
     }
     if (name == "plugin_searchpath" && type == TypeDesc::TypeString) {
@@ -163,16 +213,39 @@ getattribute (const std::string &name, TypeDesc type, void *val)
         *(ustring *)val = ustring(format_list);
         return true;
     }
+    if (name == "extension_list" && type == TypeDesc::TypeString) {
+        if (extension_list.empty())
+            pvt::catalog_all_plugins (plugin_searchpath.string());
+        *(ustring *)val = ustring(extension_list);
+        return true;
+    }
+    if (name == "library_list" && type == TypeDesc::TypeString) {
+        if (library_list.empty())
+            pvt::catalog_all_plugins (plugin_searchpath.string());
+        *(ustring *)val = ustring(library_list);
+        return true;
+    }
+    if (name == "exr_threads" && type == TypeDesc::TypeInt) {
+        *(int *)val = oiio_exr_threads;
+        return true;
+    }
+    if (name == "tiff:half" && type == TypeDesc::TypeInt) {
+        *(int *)val = tiff_half;
+        return true;
+    }
+    if (name == "debug" && type == TypeDesc::TypeInt) {
+        *(int *)val = print_debug;
+        return true;
+    }
     return false;
 }
 
 
-inline int
-quantize (float value, float quant_black, float quant_white,
-          int quant_min, int quant_max)
+inline long long
+quantize (float value, long long quant_min, long long quant_max)
 {
-    value = Imath::lerp ((float)quant_black, (float)quant_white, value);
-    return Imath::clamp ((int)(value + 0.5f), quant_min, quant_max);
+    value = value * quant_max;
+    return Imath::clamp ((long long)(value + 0.5f), quant_min, quant_max);
 }
 
 namespace {
@@ -195,14 +268,25 @@ _contiguize (const T *src, int nchannels, stride_t xstride, stride_t ystride, st
 
     if (depth < 1)     // Safeguard against volume-unaware clients
         depth = 1;
+    
     T *dstsave = dst;
-    for (int z = 0;  z < depth;  ++z, src = (const T *)((char *)src + zstride)) {
-        const T *scanline = src;
-        for (int y = 0;  y < height;  ++y, scanline = (const T *)((char *)scanline + ystride)) {
-            const T *pixel = scanline;
-            for (int x = 0;  x < width;  ++x, pixel = (const T *)((char *)pixel + xstride))
-                for (int c = 0;  c < nchannels;  ++c)
-                    *dst++ = pixel[c];
+    if (xstride == nchannels*datasize) {
+        // Optimize for contiguous scanlines, but not from scanline to scanline
+        for (int z = 0;  z < depth;  ++z, src = (const T *)((char *)src + zstride)) {
+            const T *scanline = src;
+            for (int y = 0;  y < height;  ++y, dst += nchannels*width,
+                 scanline = (const T *)((char *)scanline + ystride))
+                memcpy(dst, scanline, xstride * width);
+        }
+    } else {
+        for (int z = 0;  z < depth;  ++z, src = (const T *)((char *)src + zstride)) {
+            const T *scanline = src;
+            for (int y = 0;  y < height;  ++y, scanline = (const T *)((char *)scanline + ystride)) {
+                const T *pixel = scanline;
+                for (int x = 0;  x < width;  ++x, pixel = (const T *)((char *)pixel + xstride))
+                    for (int c = 0;  c < nchannels;  ++c)
+                        *dst++ = pixel[c];
+            }
         }
     }
     return dstsave;
@@ -221,10 +305,6 @@ pvt::contiguize (const void *src, int nchannels,
         return _contiguize ((const float *)src, nchannels, 
                             xstride, ystride, zstride,
                             (float *)dst, width, height, depth);
-    case TypeDesc::DOUBLE :
-        return _contiguize ((const double *)src, nchannels, 
-                            xstride, ystride, zstride,
-                            (double *)dst, width, height, depth);
     case TypeDesc::INT8:
     case TypeDesc::UINT8 :
         return _contiguize ((const char *)src, nchannels, 
@@ -247,6 +327,10 @@ pvt::contiguize (const void *src, int nchannels,
         return _contiguize ((const long long *)src, nchannels, 
                             xstride, ystride, zstride,
                             (long long *)dst, width, height, depth);
+    case TypeDesc::DOUBLE :
+        return _contiguize ((const double *)src, nchannels, 
+                            xstride, ystride, zstride,
+                            (double *)dst, width, height, depth);
     default:
         ASSERT (0 && "OpenImageIO::contiguize : bad format");
         return NULL;
@@ -262,23 +346,20 @@ pvt::convert_to_float (const void *src, float *dst, int nvals,
     switch (format.basetype) {
     case TypeDesc::FLOAT :
         return (float *)src;
+    case TypeDesc::UINT8 :
+        convert_type ((const unsigned char *)src, dst, nvals);
+        break;
     case TypeDesc::HALF :
         convert_type ((const half *)src, dst, nvals);
         break;
-    case TypeDesc::DOUBLE :
-        convert_type ((const double *)src, dst, nvals);
+    case TypeDesc::UINT16 :
+        convert_type ((const unsigned short *)src, dst, nvals);
         break;
     case TypeDesc::INT8:
         convert_type ((const char *)src, dst, nvals);
         break;
-    case TypeDesc::UINT8 :
-        convert_type ((const unsigned char *)src, dst, nvals);
-        break;
     case TypeDesc::INT16 :
         convert_type ((const short *)src, dst, nvals);
-        break;
-    case TypeDesc::UINT16 :
-        convert_type ((const unsigned short *)src, dst, nvals);
         break;
     case TypeDesc::INT :
         convert_type ((const int *)src, dst, nvals);
@@ -292,6 +373,9 @@ pvt::convert_to_float (const void *src, float *dst, int nvals,
     case TypeDesc::UINT64 :
         convert_type ((const unsigned long long *)src, dst, nvals);
         break;
+    case TypeDesc::DOUBLE :
+        convert_type ((const double *)src, dst, nvals);
+        break;
     default:
         ASSERT (0 && "ERROR to_float: bad format");
         return NULL;
@@ -304,20 +388,17 @@ pvt::convert_to_float (const void *src, float *dst, int nvals,
 template<typename T>
 const void *
 _from_float (const float *src, T *dst, size_t nvals,
-            float quant_black, float quant_white, int quant_min, int quant_max)
+             long long quant_min, long long quant_max)
 {
     if (! src) {
         // If no source pixels, assume zeroes
-        memset (dst, 0, nvals * sizeof(T));
-        T z = (T) quantize (0, quant_black, quant_white,
-                            quant_min, quant_max);
+        T z = T(0);
         for (size_t p = 0;  p < nvals;  ++p)
             dst[p] = z;
     } else if (std::numeric_limits <T>::is_integer) {
         // Convert float to non-float native format, with quantization
         for (size_t p = 0;  p < nvals;  ++p)
-            dst[p] = (T) quantize (src[p], quant_black, quant_white,
-                                   quant_min, quant_max);
+            dst[p] = (T) quantize (src[p], quant_min, quant_max);
     } else {
         // It's a floating-point type of some kind -- we don't apply 
         // quantization
@@ -337,53 +418,41 @@ _from_float (const float *src, T *dst, size_t nvals,
 
 const void *
 pvt::convert_from_float (const float *src, void *dst, size_t nvals,
-                         int quant_black, int quant_white,
-                         int quant_min, int quant_max,
-                         TypeDesc format)
+                         long long quant_min, long long quant_max, TypeDesc format)
 {
     switch (format.basetype) {
     case TypeDesc::FLOAT :
         return src;
     case TypeDesc::HALF :
         return _from_float<half> (src, (half *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                                  quant_min, quant_max);
     case TypeDesc::DOUBLE :
         return _from_float (src, (double *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     case TypeDesc::INT8:
         return _from_float (src, (char *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     case TypeDesc::UINT8 :
         return _from_float (src, (unsigned char *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     case TypeDesc::INT16 :
         return _from_float (src, (short *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     case TypeDesc::UINT16 :
         return _from_float (src, (unsigned short *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     case TypeDesc::INT :
         return _from_float (src, (int *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     case TypeDesc::UINT :
         return _from_float (src, (unsigned int *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     case TypeDesc::INT64 :
         return _from_float (src, (long long *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     case TypeDesc::UINT64 :
         return _from_float (src, (unsigned long long *)dst, nvals,
-                           quant_black, quant_white, quant_min,
-                           quant_max);
+                            quant_min, quant_max);
     default:
         ASSERT (0 && "ERROR from_float: bad format");
         return NULL;
@@ -391,10 +460,29 @@ pvt::convert_from_float (const float *src, void *dst, size_t nvals,
 }
 
 
+const void *
+pvt::parallel_convert_from_float (const float *src, void *dst, size_t nvals,
+                                  TypeDesc format)
+{
+    if (format.basetype == TypeDesc::FLOAT)
+        return src;
+
+    const int64_t blocksize = 100000;   // good choice?
+    long long quant_min, quant_max;
+    get_default_quantize (format, quant_min, quant_max);
+
+    parallel_for_chunked (0, int64_t(nvals), blocksize, [=](int64_t b, int64_t e){
+        convert_from_float (src+b, (char *)dst+b*format.size(),
+                            e-b, quant_min, quant_max, format);
+    });
+    return dst;
+}
+
+
+
 bool
 convert_types (TypeDesc src_type, const void *src, 
-               TypeDesc dst_type, void *dst, int n,
-               int alpha_channel, int z_channel)
+               TypeDesc dst_type, void *dst, int n)
 {
     // If no conversion is necessary, just memcpy
     if ((src_type == dst_type || dst_type.basetype == TypeDesc::UNKNOWN)) {
@@ -402,39 +490,29 @@ convert_types (TypeDesc src_type, const void *src,
         return true;
     }
 
-    // Conversions are via a temporary float array
-    bool use_tmp = false;
-    boost::scoped_array<float> tmp;
-    float *buf;
-    if (src_type == TypeDesc::FLOAT) {
-        buf = (float *) src;
-    } else {
-        tmp.reset (new float[n]);  // Will be freed when tmp exists its scope
-        buf = tmp.get();
-        use_tmp = true;
+    if (dst_type == TypeDesc::TypeFloat) {
+        // Special case -- converting non-float to float
+        pvt::convert_to_float (src, (float *)dst, n, src_type);
+        return true;
     }
 
-    if (use_tmp) {
-        // Convert from 'src_type' to float (or nothing, if already float)
-        switch (src_type.basetype) {
-        case TypeDesc::UINT8 : convert_type ((const unsigned char *)src, buf, n); break;
-        case TypeDesc::UINT16 : convert_type ((const unsigned short *)src, buf, n); break;
-        case TypeDesc::FLOAT : convert_type ((const float *)src, buf, n); break;
-        case TypeDesc::HALF :  convert_type ((const half *)src, buf, n); break;
-        case TypeDesc::DOUBLE : convert_type ((const double *)src, buf, n); break;
-        case TypeDesc::INT8 :  convert_type ((const char *)src, buf, n);  break;
-        case TypeDesc::INT16 : convert_type ((const short *)src, buf, n); break;
-        case TypeDesc::INT :   convert_type ((const int *)src, buf, n); break;
-        case TypeDesc::UINT :  convert_type ((const unsigned int *)src, buf, n);  break;
-        case TypeDesc::INT64 : convert_type ((const long long *)src, buf, n); break;
-        case TypeDesc::UINT64 : convert_type ((const unsigned long long *)src, buf, n);  break;
-        default:         return false;  // unknown format
+    // Conversion is to a non-float type
+
+    std::unique_ptr<float[]> tmp;   // In case we need a lot of temp space
+    float *buf = (float *)src;
+    if (src_type != TypeDesc::TypeFloat) {
+        // If src is also not float, convert through an intermediate buffer
+        if (n <= 4096)  // If < 16k, use the stack
+            buf = ALLOCA (float, n);
+        else {
+            tmp.reset (new float[n]);  // Freed when tmp exists its scope
+            buf = tmp.get();
         }
+        pvt::convert_to_float (src, buf, n, src_type);
     }
 
-    // Convert float to 'dst_type' (just a copy if dst is float)
+    // Convert float to 'dst_type'
     switch (dst_type.basetype) {
-    case TypeDesc::FLOAT :  memcpy (dst, buf, n * sizeof(float));       break;
     case TypeDesc::UINT8 :  convert_type (buf, (unsigned char *)dst, n);  break;
     case TypeDesc::UINT16 : convert_type (buf, (unsigned short *)dst, n); break;
     case TypeDesc::HALF :   convert_type (buf, (half *)dst, n);   break;
@@ -476,8 +554,8 @@ convert_image (int nchannels, int width, int height, int depth,
     ImageSpec::auto_stride (dst_xstride, dst_ystride, dst_zstride,
                             dst_type, nchannels, width, height);
     bool result = true;
-    bool contig = (src_xstride == dst_xstride &&
-                   src_xstride == stride_t(nchannels*src_type.size()));
+    bool contig = (src_xstride == stride_t(nchannels * src_type.size()) &&
+                   dst_xstride == stride_t(nchannels * dst_type.size()));
     for (int z = 0;  z < depth;  ++z) {
         for (int y = 0;  y < height;  ++y) {
             const char *f = (const char *)src + (z*src_zstride + y*src_ystride);
@@ -489,14 +567,12 @@ convert_image (int nchannels, int width, int height, int depth,
                 // unit.  (Note that within convert_types, a memcpy will
                 // be used if the formats are identical.)
                 result &= convert_types (src_type, f, dst_type, t,
-                                         nchannels*width,
-                                         alpha_channel, z_channel);
+                                         nchannels*width);
             } else {
                 // General case -- anything goes with strides.
                 for (int x = 0;  x < width;  ++x) {
                     result &= convert_types (src_type, f, dst_type, t,
-                                             nchannels,
-                                             alpha_channel, z_channel);
+                                             nchannels);
                     f += src_xstride;
                     t += dst_xstride;
                 }
@@ -504,6 +580,44 @@ convert_image (int nchannels, int width, int height, int depth,
         }
     }
     return result;
+}
+
+
+
+bool
+parallel_convert_image (int nchannels, int width, int height, int depth,
+               const void *src, TypeDesc src_type,
+               stride_t src_xstride, stride_t src_ystride,
+               stride_t src_zstride,
+               void *dst, TypeDesc dst_type,
+               stride_t dst_xstride, stride_t dst_ystride,
+               stride_t dst_zstride,
+               int alpha_channel, int z_channel, int nthreads)
+{
+    if (nthreads <= 0)
+        nthreads = oiio_threads;
+    nthreads = clamp (int((int64_t(width)*height*depth*nchannels)/100000), 1, nthreads);
+    if (nthreads <= 1)
+        return convert_image (nchannels, width, height, depth,
+                        src, src_type, src_xstride, src_ystride, src_zstride,
+                        dst, dst_type, dst_xstride, dst_ystride, dst_zstride,
+                        alpha_channel, z_channel);
+
+    ImageSpec::auto_stride (src_xstride, src_ystride, src_zstride,
+                            src_type, nchannels, width, height);
+    ImageSpec::auto_stride (dst_xstride, dst_ystride, dst_zstride,
+                            dst_type, nchannels, width, height);
+
+    int blocksize = std::max (1, height / nthreads);
+    parallel_for_chunked (0, height, blocksize, [=](int id, int64_t ybegin, int64_t yend){
+        convert_image (nchannels, width, yend-ybegin, depth,
+                       (const char *)src+src_ystride*ybegin,
+                       src_type, src_xstride, src_ystride, src_zstride,
+                       (char *)dst+dst_ystride*ybegin,
+                       dst_type, dst_xstride, dst_ystride, dst_zstride,
+                       alpha_channel, z_channel);
+    });
+    return true;
 }
 
 
@@ -547,40 +661,59 @@ copy_image (int nchannels, int width, int height, int depth,
 
 
 void
-DeepData::init (int npix, int nchan,
-                const TypeDesc *chbegin, const TypeDesc *chend)
+add_dither (int nchannels, int width, int height, int depth,
+            float *data, stride_t xstride, stride_t ystride, stride_t zstride,
+            float ditheramplitude,
+            int alpha_channel, int z_channel, unsigned int ditherseed,
+            int chorigin, int xorigin, int yorigin, int zorigin)
 {
-    clear ();
-    npixels = npix;
-    nchannels = nchan;
-    channeltypes.assign (chbegin, chend);
-    nsamples.resize (npixels, 0);
-    pointers.resize (size_t(npixels)*size_t(nchannels), NULL);
+    ImageSpec::auto_stride (xstride, ystride, zstride,
+                            sizeof(float), nchannels, width, height);
+    char *plane = (char *)data;
+    for (int z = 0;  z < depth;  ++z, plane += zstride) {
+        char *scanline = plane;
+        for (int y = 0;  y < height;  ++y, scanline += ystride) {
+            char *pixel = scanline;
+            uint32_t ba = (z+zorigin)*1311 + yorigin+y;
+            uint32_t bb = ditherseed + (chorigin<<24);
+            uint32_t bc = xorigin;
+            for (int x = 0;  x < width;  ++x, pixel += xstride) {
+                float *val = (float *)pixel;
+                for (int c = 0;  c < nchannels;  ++c, ++val, ++bc) {
+                    bjhash::bjmix (ba, bb, bc);
+                    int channel = c+chorigin;
+                    if (channel == alpha_channel || channel == z_channel)
+                        continue;
+                    float dither = bc / float(std::numeric_limits<uint32_t>::max());
+                    *val += ditheramplitude * (dither - 0.5f);
+                }
+            }
+        }
+    }
 }
 
 
 
-void
-DeepData::alloc ()
+template<typename T>
+static void
+premult_impl (int nchannels, int width, int height, int depth,
+              int chbegin, int chend,
+              T *data, stride_t xstride, stride_t ystride, stride_t zstride,
+              int alpha_channel, int z_channel)
 {
-    // Calculate the total size we need, align each channel to 4 byte boundary
-    size_t totalsamples = 0, totalbytes = 0;
-    for (int i = 0;  i < npixels;  ++i) {
-        int s = nsamples[i];
-        totalsamples += s;
-        for (int c = 0;  c < nchannels;  ++c)
-            totalbytes += round_to_multiple (channeltypes[c].size() * s, 4);
-    }
-
-    // Set all the data pointers to the right offsets within the
-    // data block.  Leave the pointes NULL for pixels with no samples.
-    data.resize (totalbytes);
-    char *p = &data[0];
-    for (int i = 0;  i < npixels;  ++i) {
-        if (nsamples[i]) {
-            for (int c = 0;  c < nchannels;  ++c) {
-                pointers[i*nchannels+c] = p;
-                p += round_to_multiple (channeltypes[c].size()*nsamples[i], 4);
+    char *plane = (char *)data;
+    for (int z = 0;  z < depth;  ++z, plane += zstride) {
+        char *scanline = plane;
+        for (int y = 0;  y < height;  ++y, scanline += ystride) {
+            char *pixel = scanline;
+            for (int x = 0;  x < width;  ++x, pixel += xstride) {
+                DataArrayProxy<T,float> val ((T*)pixel);
+                float alpha = val[alpha_channel];
+                for (int c = chbegin;  c < chend;  ++c) {
+                    if (c == alpha_channel || c == z_channel)
+                        continue;
+                    val[c] = alpha * val[c];
+                }
             }
         }
     }
@@ -589,25 +722,134 @@ DeepData::alloc ()
 
 
 void
-DeepData::clear ()
+premult (int nchannels, int width, int height, int depth,
+         int chbegin, int chend,
+         TypeDesc datatype, void *data,
+         stride_t xstride, stride_t ystride, stride_t zstride,
+         int alpha_channel, int z_channel)
 {
-    npixels = 0;
-    nchannels = 0;
-    channeltypes.clear();
-    nsamples.clear();
-    pointers.clear();
-    data.clear();
+    if (alpha_channel < 0 || alpha_channel > nchannels)
+        return;  // nothing to do
+    ImageSpec::auto_stride (xstride, ystride, zstride,
+                            datatype.size(), nchannels, width, height);
+    switch (datatype.basetype) {
+    case TypeDesc::FLOAT :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (float*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::UINT8 :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (unsigned char*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::UINT16 :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (unsigned short*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::HALF :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (half*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::INT8 :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (char*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::INT16 :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (short*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::INT :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (int*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::UINT :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (unsigned int*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::INT64 :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (int64_t*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::UINT64 :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (uint64_t*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    case TypeDesc::DOUBLE :
+        premult_impl (nchannels, width, height, depth, chbegin, chend,
+                      (double*)data, xstride, ystride, zstride,
+                      alpha_channel, z_channel);
+        break;
+    default: break;
+    }
 }
 
 
 
-void
-DeepData::free ()
+bool
+wrap_black (int &coord, int origin, int width)
 {
-    std::vector<unsigned int>().swap (nsamples);
-    std::vector<void *>().swap (pointers);
-    std::vector<char>().swap (data);
+    return (coord >= origin && coord < (width+origin));
 }
 
+
+bool
+wrap_clamp (int &coord, int origin, int width)
+{
+    if (coord < origin)
+        coord = origin;
+    else if (coord >= origin+width)
+        coord = origin+width-1;
+    return true;
 }
-OIIO_NAMESPACE_EXIT
+
+
+bool
+wrap_periodic (int &coord, int origin, int width)
+{
+    coord -= origin;
+    coord %= width;
+    if (coord < 0)       // Fix negative values
+        coord += width;
+    coord += origin;
+    return true;
+}
+
+
+bool
+wrap_periodic_pow2 (int &coord, int origin, int width)
+{
+    DASSERT (ispow2(width));
+    coord -= origin;
+    coord &= (width - 1); // Shortcut periodic if we're sure it's a pow of 2
+    coord += origin;
+    return true;
+}
+
+
+bool
+wrap_mirror (int &coord, int origin, int width)
+{
+    coord -= origin;
+    if (coord < 0)
+        coord = -coord - 1;
+    int iter = coord / width;    // Which iteration of the pattern?
+    coord -= iter * width;
+    if (iter & 1)  // Odd iterations -- flip the sense
+        coord = width - 1 - coord;
+    DASSERT_MSG (coord >= 0 && coord < width,
+                 "width=%d, origin=%d, result=%d", width, origin, coord);
+    coord += origin;
+    return true;
+}
+
+
+OIIO_NAMESPACE_END

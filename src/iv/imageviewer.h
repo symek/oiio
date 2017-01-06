@@ -42,24 +42,23 @@
 #endif
 
 // included to remove std::min/std::max errors
-#include "osdep.h"
+#include "OpenImageIO/platform.h"
 
 #include <vector>
 
-// This needs to be included before GL.h
 #include <glew.h>
-
-#include <QtGui/QAction>
-#include <QtGui/QCheckBox>
-#include <QtGui/QDialog>
-#include <QtGui/QMainWindow>
+#include <QGLWidget>
+#include <QAction>
+#include <QCheckBox>
+#include <QDialog>
+#include <QMainWindow>
 
 #ifndef QT_NO_PRINTER
-#include <QtGui/QPrinter>
+// #include <QPrinter>
 #endif
 
-#include "imageio.h"
-#include "imagebuf.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/imagebuf.h"
 
 OIIO_NAMESPACE_USING;
 
@@ -92,12 +91,12 @@ public:
     /// select_channel() methods will work.
     /// Also, scanline will return a pointer to that buffer instead of the read
     /// buffer.
-    virtual bool read (int subimage=0, int miplevel=0,
-                       bool force=false, TypeDesc format = TypeDesc::UNKNOWN,
-                       ProgressCallback progress_callback=NULL,
-                       void *progress_callback_data=NULL, bool secondary_buffer=false);
-    virtual bool init_spec (const std::string &filename,
-                            int subimage, int miplevel);
+    bool read_iv (int subimage=0, int miplevel=0,
+                  bool force=false, TypeDesc format = TypeDesc::UNKNOWN,
+                  ProgressCallback progress_callback=NULL,
+                  void *progress_callback_data=NULL, bool secondary_buffer=false);
+    bool init_spec_iv (const std::string &filename,
+                       int subimage, int miplevel);
 
     float gamma (void) const { return m_gamma; }
     void gamma (float e) { m_gamma = e; }
@@ -108,7 +107,7 @@ public:
         if (m_corrected_image.localpixels()) {
             return m_corrected_image.nchannels();
         }
-        return m_spec.nchannels;
+        return spec().nchannels;
     }
 
     std::string shortinfo () const;
@@ -133,13 +132,11 @@ public:
     /// color space correction when indicated.
     void pixel_transform (bool srgb_to_linear, int color_mode, int channel);
 
-    bool get_pixels (int xbegin, int xend, int ybegin, int yend,
-                     TypeDesc format, void *result) {
-        if (m_corrected_image.localpixels ()) {
-            return m_corrected_image.get_pixels (xbegin, xend, ybegin, yend,
-                                                  0, 1, format, result);
-        }
-        return ImageBuf::get_pixels (xbegin, xend, ybegin, yend, 0, 1, format, result);
+    bool get_pixels (ROI roi, TypeDesc format, void *result) {
+        if (m_corrected_image.localpixels ())
+            return m_corrected_image.get_pixels (roi, format, result);
+        else
+            return ImageBuf::get_pixels (roi, format, result);
     }
 
     bool auto_subimage (void) const { return m_auto_subimage; }
@@ -335,7 +332,7 @@ private:
     IvPreferenceWindow *preferenceWindow;
 
 #ifndef QT_NO_PRINTER
-    QPrinter printer;
+    // QPrinter printer;
 #endif
 
     QAction *openAct, *reloadAct, *closeImgAct;

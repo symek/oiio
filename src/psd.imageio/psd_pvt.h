@@ -31,9 +31,9 @@
 #ifndef OPENIMAGEIO_PSD_PVT_H
 #define OPENIMAGEIO_PSD_PVT_H
 
-#include "imageio.h"
-#include "filesystem.h"
-#include "fmath.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/fmath.h"
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
 
@@ -66,7 +66,7 @@ namespace psd_pvt {
         std::streampos pos;
     };
 
-};  // namespace psd_pvt
+}  // namespace psd_pvt
 
 OIIO_PLUGIN_NAMESPACE_END
 

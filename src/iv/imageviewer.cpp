@@ -28,9 +28,6 @@
   (This is the Modified BSD License)
 */
 
-#include "imageviewer.h"
-#include "ivgl.h"
-
 #include <iostream>
 #include <cmath>
 #ifndef WIN32
@@ -38,34 +35,34 @@
 #endif
 #include <vector>
 
-#include <boost/foreach.hpp>
-#include <boost/filesystem.hpp>
+#include "imageviewer.h"
+#include "ivgl.h"
 
-#include <QtCore/QSettings>
-#include <QtCore/QTimer>
-#include <QtGui/QApplication>
-#include <QtGui/QComboBox>
-#include <QtGui/QDesktopWidget>
-#include <QtGui/QFileDialog>
-#include <QtGui/QKeyEvent>
-#include <QtGui/QLabel>
-#include <QtGui/QMenu>
-#include <QtGui/QMenuBar>
-#include <QtGui/QMessageBox>
-#include <QtGui/QProgressBar>
-#include <QtGui/QResizeEvent>
-#include <QtGui/QSpinBox>
-#include <QtGui/QStatusBar>
+#include <QSettings>
+#include <QTimer>
+#include <QApplication>
+#include <QComboBox>
+#include <QDesktopWidget>
+#include <QFileDialog>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QMenu>
+#include <QMenuBar>
+#include <QMessageBox>
+#include <QProgressBar>
+#include <QResizeEvent>
+#include <QSpinBox>
+#include <QStatusBar>
 
 #include <OpenEXR/ImathFun.h>
 
-#include "dassert.h"
-#include "strutil.h"
-#include "timer.h"
-#include "fmath.h"
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/timer.h"
+#include "OpenImageIO/fmath.h"
+#include "OpenImageIO/sysutil.h"
+#include "OpenImageIO/filesystem.h"
 #include "ivutils.h"
-#include "sysutil.h"
-#include "filesystem.h"
 
 
 namespace
@@ -79,16 +76,17 @@ namespace
 
 
 static const char *s_file_filters = ""
-    "Image Files (*.bmp *.cin *.dds *.dpx *.f3d *.fits *.hdr *.ico *.iff *.jpg "
-    "*.jpe *.jpeg *.jif *.jfif *.jfi *.jp2 *.j2k *.exr *.png *.pbm *.pgm *.ppm "
-    "*.ptex *.rla *.sgi *.rgb *.rgba *.bw *.int *.inta *.pic *.tga *.tpic "
-    "*.tif *.tiff *.tx *.env *.sm *.vsm *.zfile);;"
+    "Image Files (*.bmp *.cin *.dds *.dpx *.f3d *.fits *.gif *.hdr *.ico *.iff "
+    "*.jpg *.jpe *.jpeg *.jif *.jfif *.jfi *.jp2 *.j2k *.exr *.png *.pbm *.pgm "
+    "*.ppm *.ptex *.rla *.sgi *.rgb *.rgba *.bw *.int *.inta *.pic *.tga "
+    "*.tpic *.tif *.tiff *.tx *.env *.sm *.vsm *.zfile);;"
     "BMP (*.bmp);;"
     "Cineon (*.cin);;"
     "Direct Draw Surface (*.dds);;"
     "DPX (*.dpx);;"
     "Field3D (*.f3d);;"
     "FITS (*.fits);;"
+    "GIF (*.gif);;"
     "HDR/RGBE (*.hdr);;"
     "Icon (*.ico);;"
     "IFF (*.iff);;"
@@ -158,7 +156,7 @@ ImageViewer::ImageViewer ()
 
 ImageViewer::~ImageViewer ()
 {
-    BOOST_FOREACH (IvImage *i, m_images)
+    for (auto i : m_images)
         delete i;
 }
 
@@ -595,7 +593,7 @@ ImageViewer::readSettings (bool ui_is_set_up)
     linearInterpolationBox->setChecked (settings.value ("linearInterpolation").toBool());
     darkPaletteBox->setChecked (settings.value ("darkPalette").toBool());
     QStringList recent = settings.value ("RecentFiles").toStringList();
-    BOOST_FOREACH (const QString &s, recent)
+    for (auto&& s : recent)
         addRecentFile (s.toStdString());
     updateRecentFilesMenu (); // only safe because it's called after menu setup
 
@@ -626,7 +624,7 @@ ImageViewer::writeSettings()
     settings.setValue ("maxMemoryIC", maxMemoryIC->value());
     settings.setValue ("slideShowDuration", slideShowDuration->value());
     QStringList recent;
-    BOOST_FOREACH (const std::string &s, m_recent_files)
+    for (auto&& s : m_recent_files)
         recent.push_front (QString(s.c_str()));
     settings.setValue ("RecentFiles", recent);
 }
@@ -665,7 +663,7 @@ ImageViewer::open()
         add_image (filename);
 //        int n = m_images.size()-1;
 //        IvImage *newimage = m_images[n];
-//        newimage->read (0, false, image_progress_callback, this);
+//        newimage->read_iv (0, false, image_progress_callback, this);
     }
     if (old_lastimage >= 0) {
         // Otherwise, add_image already did this for us.
@@ -763,8 +761,8 @@ ImageViewer::add_image (const std::string &filename)
     if (filename.empty())
         return;
     IvImage *newimage = new IvImage(filename);
-    newimage->gamma (m_default_gamma);
     ASSERT (newimage);
+    newimage->gamma (m_default_gamma);
     m_images.push_back (newimage);
     addRecentFile (filename);
     updateRecentFilesMenu ();
@@ -802,7 +800,7 @@ ImageViewer::saveAs()
                                          tr(s_file_filters));
     if (name.isEmpty())
         return;
-    bool ok = img->save (name.toStdString(), "", image_progress_callback, this);
+    bool ok = img->write (name.toStdString(), "", image_progress_callback, this);
     if (! ok) {
         std::cerr << "Save failed: " << img->geterror() << "\n";
     }
@@ -821,7 +819,7 @@ ImageViewer::saveWindowAs()
                                          QString(img->name().c_str()));
     if (name.isEmpty())
         return;
-    img->save (name.toStdString(), "", image_progress_callback, this);  // FIXME
+    img->write (name.toStdString(), "", image_progress_callback, this);  // FIXME
 }
 
 
@@ -837,7 +835,7 @@ ImageViewer::saveSelectionAs()
                                          QString(img->name().c_str()));
     if (name.isEmpty())
         return;
-    img->save (name.toStdString(), "", image_progress_callback, this);  // FIXME
+    img->write (name.toStdString(), "", image_progress_callback, this);  // FIXME
 }
 
 
@@ -978,7 +976,7 @@ ImageViewer::loadCurrentImage (int subimage, int miplevel)
         //}
 
         // Read the image from disk or from the ImageCache if available.
-        if (img->read (subimage, miplevel, false, read_format, image_progress_callback, this, allow_transforms)) {
+        if (img->read_iv (subimage, miplevel, false, read_format, image_progress_callback, this, allow_transforms)) {
             // The image was read succesfully.
             // Check if we've got to do sRGB to linear (ie, when not supported
             // by OpenGL).
@@ -1075,7 +1073,7 @@ ImageViewer::deleteCurrentImage()
 void
 ImageViewer::current_image (int newimage)
 {
-#ifdef DEBUG
+#ifndef NDEBUG
     Timer swap_image_time;
     swap_image_time.start();
 #endif
@@ -1088,7 +1086,7 @@ ImageViewer::current_image (int newimage)
     } else {
         displayCurrentImage (false);
     }
-#ifdef DEBUG
+#ifndef NDEBUG
     swap_image_time.stop();
     std::cerr << "Current Image change elapsed time: " << swap_image_time() << " seconds \n";
 #endif
@@ -1245,7 +1243,7 @@ ImageViewer::slide (long t, bool b)
 void
 ImageViewer::viewChannel (int c, COLOR_MODE colormode)
 {
-#ifdef DEBUG
+#ifndef NDEBUG
     Timer change_channel_time;
     change_channel_time.start();
 #endif
@@ -1285,7 +1283,7 @@ ImageViewer::viewChannel (int c, COLOR_MODE colormode)
         viewColor1ChAct->setChecked (m_color_mode == SINGLE_CHANNEL);
         viewColorHeatmapAct->setChecked (m_color_mode == HEATMAP);
     }
-#ifdef DEBUG
+#ifndef NDEBUG
     change_channel_time.stop();
     std::cerr << "Change channel elapsed time: " << change_channel_time() << " seconds \n";
 #endif
@@ -1430,7 +1428,7 @@ compImageDate (IvImage *first, IvImage *second)
             if (metadatatime.empty()){
                 if (! Filesystem::exists (first->name ()))
                     return false;
-                firstFile = boost::filesystem::last_write_time (first->name ());
+                firstFile = Filesystem::last_write_time (first->name ());
             }
         }
         else
@@ -1444,7 +1442,7 @@ compImageDate (IvImage *first, IvImage *second)
             if (metadatatime.empty()){
                 if (! Filesystem::exists (second->name ()))
                     return true;
-                secondFile = boost::filesystem::last_write_time (second->name());
+                secondFile = Filesystem::last_write_time (second->name());
             }
         }
         else
@@ -1480,10 +1478,10 @@ compFileDate (IvImage *first, IvImage *second)
     double diff;
     if (! Filesystem::exists (first->name ()))
         return false;
-    firstFile = boost::filesystem::last_write_time (first->name ());
+    firstFile = Filesystem::last_write_time (first->name());
     if (! Filesystem::exists (second->name ()))
         return true;
-    secondFile = boost::filesystem::last_write_time (second->name ());
+    secondFile = Filesystem::last_write_time (second->name());
     diff = difftime(firstFile, secondFile);
     if (diff == 0)
         return compName(first, second);

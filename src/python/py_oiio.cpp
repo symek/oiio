@@ -34,154 +34,76 @@ namespace PyOpenImageIO
 {
 using namespace boost::python;
 
-// This our stand-in ProgressCallback which allows oiio to call a Python function.
-bool PythonProgressCallback(void* opaque_data, float portion_done)
+
+
+const char *
+python_array_code (TypeDesc format)
 {
-	// When oiio calls our ProgressCallback, it will give back the opaque_data which
-	// we can turn back into a Python object, which will turn out to be the
-	// function we are supposed to call.
-	boost::python::object* obj = reinterpret_cast<boost::python::object*>(opaque_data);
-
-	// One-liner to call the function and return a result as a bool
-	return boost::python::extract<bool>((*obj)(portion_done));
+    switch (format.basetype) {
+    case TypeDesc::UINT8 :  return "B";
+    case TypeDesc::INT8 :   return "b";
+    case TypeDesc::UINT16 : return "H";
+    case TypeDesc::INT16 :  return "h";
+    case TypeDesc::UINT32 : return "I";
+    case TypeDesc::INT32 :  return "i";
+    case TypeDesc::FLOAT :  return "f";
+    case TypeDesc::DOUBLE : return "d";
+    case TypeDesc::HALF :   return "H";  // Return half in uint16
+    default :
+        // For any other type, including UNKNOWN, pack it into an
+        // unsigned byte array.
+        return "B";
+    }
 }
 
-// This is standing in for a method from oiio which takes a ProgressCallback.
-void progress_callback_example_original(ProgressCallback pc, void* opaque_data)
+
+
+TypeDesc
+typedesc_from_python_array_code (char code)
 {
-	for (float f = 0.0; f < 10.0; ++f)
-	{
-		bool result = pc(opaque_data, f);
-		if (!result)
-		{
-			std::cout << "Callback example terminated at " << f << std::endl;
-			return;
-		}
-	}
+    switch (code) {
+    case 'b' :
+    case 'c' : return TypeDesc::INT8;
+    case 'B' : return TypeDesc::UINT8;
+    case 'h' : return TypeDesc::INT16;
+    case 'H' : return TypeDesc::UINT16;
+    case 'i' : return TypeDesc::INT;
+    case 'I' : return TypeDesc::UINT;
+    case 'l' : return TypeDesc::INT;
+    case 'L' : return TypeDesc::UINT;
+    case 'f' : return TypeDesc::FLOAT;
+    case 'd' : return TypeDesc::DOUBLE;
+    }
+    return TypeDesc::UNKNOWN;
 }
 
-// This is a wrapper for the above stand-in oiio function.
-void progress_callback_wrapper(object progress_callback)
+
+
+object
+C_array_to_Python_array (const char *data, TypeDesc type, size_t size)
 {
-	// Casting the object to a pointer is kind of dangerious, but safe in this case
-	// because we know its lifetime will be tied to this function.
-	progress_callback_example_original(&PythonProgressCallback, &progress_callback);
+    // Figure out what kind of array to return and create it
+    object arr_module(handle<>(PyImport_ImportModule("array")));
+    object array = arr_module.attr("array")(python_array_code(type));
+
+    // Create a Python byte array (or string for Python2) to hold the
+    // data.
+#if PY_MAJOR_VERSION >= 3
+    object string_py(handle<>(PyBytes_FromStringAndSize(data, size)));
+#else
+    object string_py(handle<>(PyString_FromStringAndSize(data, size)));
+#endif
+
+    // Copy the data from the string to the array, then return the array.
+#if (PY_MAJOR_VERSION < 3) || (PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION < 2)
+    array.attr("fromstring")(string_py);
+#else
+    array.attr("frombytes")(string_py);
+#endif
+    return array;
 }
 
 
-object create_array(int length)
-{
-	// Make some dummy data - this would normally be coming
-	// from oiio, and wouldn't necessarily be int. In fact,
-	// it would usually be void - we'd have to determine the
-	// desired type from the TypeDesc.
-	int* test = new int[length];
-	for (int i = 0; i < length; ++i) test[i] = i;
-
-	// Import the Python array module and instantly wrap it
-	// in a Boost.Python handle. This means BP will take care
-	// of reference-counting Python objects for us.
-	object module(handle<>(PyImport_ImportModule("array")));
-	
-	// This is Boost.Python's way of finding and calling a
-	// function within the module. It's a bit like doing
-	// >>> import array as module
-	// >>> array = getattr(module, "array")("i")
-	object array = module.attr("array")("i");
-
-	// Now for something ugly. The array module doesn't
-	// provide a convenient way to construct an array
-	// from C, so we will abuse the fromstring method.
-	// First we create a Python string using the most
-	// direct method available to us (i.e. avoiding boost)
-	// and then we pass that into the fromstring method.
-	// It only actually results in one extra copy so it's
-	// not all that bad.
-	object data(
-		handle<>(
-			PyString_FromStringAndSize(
-					reinterpret_cast<const char*>(test),
-					sizeof(int) * length)));
-
-	array.attr("fromstring")(data);
-
-	// Tidy up and prove to ourselves that the returned
-	// array really stands on its own.
-	delete[] test;
-
-	return array;
-}
-
-// OIIO often expects the user to allocate an array, pass in
-// the pointer and have that array filled. Python provides
-// the buffer interface for that. The array module is one way
-// of creating a buffer. If an array is passed into this
-// function, it will be treated as an int array and filled
-// with int data. So it's up to the user to pass the right
-// kind of array, of the right size - just like the OIIO C++
-// interface.
-void fill_array(const object& buffer)
-{
-	// We'll pretend it's an int array but we don't actually
-	// know - it's just an area of memory.
-	int* array;
-	Py_ssize_t length;
-	int success = PyObject_AsWriteBuffer(buffer.ptr(), reinterpret_cast<void**>(&array), &length);
-
-	// throw_error_already_set is Boost.Python's way of
-	// throwing Python exceptions from within C++.
-	if (success != 0) throw_error_already_set();
-
-	// Fill the buffer with dummy data.
-	for (int i = 0; i < length / static_cast<int>(sizeof(int)); ++i)
-	{
-		array[i] = i;
-	}
-}
-
-void print_array(const object& buffer)
-{
-	using namespace std;
-
-	object module(handle<>(PyImport_ImportModule("array")));
-	
-	int isArray = PyObject_IsInstance(buffer.ptr(), object(module.attr("array")).ptr());
-	if (isArray == -1) throw_error_already_set();
-
-	char type = 'i';
-	int size = sizeof(int);
-
-	if (isArray) {
-		type = extract<string>(buffer.attr("typecode"))()[0];
-		size = extract<int>(buffer.attr("itemsize"));
-	}
-
-	const void* array;
-	Py_ssize_t length;
-	int success = PyObject_AsReadBuffer(buffer.ptr(), &array, &length);
-
-    if (success != 0) boost::python::throw_error_already_set();
-
-	switch (type)
-	{
-	case 'i':
-		for (int i = 0; i < length / size; ++i) cout << ((int*)array)[i] << endl;
-		break;
-	case 'f':
-		for (int i = 0; i < length / size; ++i) cout << ((float*)array)[i] << endl;
-		break;
-	case 'c':
-		for (int i = 0; i < length / size; ++i) cout << ((char*)array)[i] << endl;
-		break;
-	default:
-		throw std::runtime_error("Can't print this array type");
-	}
-}
-
-bool PyProgressCallback(void *function, float data) {
-    boost::python::object *func = reinterpret_cast<boost::python::object*>(function);
-    return boost::python::extract<bool>((*func)(data));
-}
 
 struct ustring_to_python_str {
     static PyObject* convert(ustring const& s) {
@@ -199,14 +121,23 @@ struct ustring_from_python_str
     }
 
     static void* convertible(PyObject* obj_ptr) {
+#if PY_MAJOR_VERSION >= 3
+        if (!PyUnicode_Check(obj_ptr)) return 0;
+#else
         if (!PyString_Check(obj_ptr)) return 0;
+#endif
         return obj_ptr;
     }
 
     static void construct(
             PyObject* obj_ptr,
             boost::python::converter::rvalue_from_python_stage1_data* data) {
+#if PY_MAJOR_VERSION >= 3
+        PyObject* pyStr = PyUnicode_AsUTF8String(obj_ptr);
+        const char* value = PyBytes_AsString(pyStr);
+#else
         const char* value = PyString_AsString(obj_ptr);
+#endif
         if (value == 0) boost::python::throw_error_already_set();
         void* storage = (
                 (boost::python::converter::rvalue_from_python_storage<ustring>*)
@@ -216,25 +147,255 @@ struct ustring_from_python_str
     }
 };
 
-BOOST_PYTHON_MODULE(OpenImageIO) {
 
+
+bool
+oiio_attribute_int (const std::string &name, int val)
+{
+    return OIIO::attribute (name, val);
+}
+
+
+bool
+oiio_attribute_float (const std::string &name, float val)
+{
+    return OIIO::attribute (name, val);
+}
+
+
+bool
+oiio_attribute_string (const std::string &name, const std::string &val)
+{
+    return OIIO::attribute (name, val);
+}
+
+
+
+bool
+oiio_attribute_typed (const std::string &name, TypeDesc type, object &obj)
+{
+    if (type.basetype == TypeDesc::INT) {
+        std::vector<int> vals;
+        py_to_stdvector (vals, obj);
+        if (vals.size() == type.numelements()*type.aggregate)
+            return OIIO::attribute (name, type, &vals[0]);
+        return false;
+    }
+    if (type.basetype == TypeDesc::FLOAT) {
+        std::vector<float> vals;
+        py_to_stdvector (vals, obj);
+        if (vals.size() == type.numelements()*type.aggregate)
+            return OIIO::attribute (name, type, &vals[0]);
+        return false;
+    }
+    if (type.basetype == TypeDesc::STRING) {
+        std::vector<std::string> vals;
+        py_to_stdvector (vals, obj);
+        if (vals.size() == type.numelements()*type.aggregate) {
+            std::vector<ustring> u;
+            for (size_t i = 0, e = vals.size(); i < e; ++i)
+                u.push_back (ustring(vals[i]));
+            return OIIO::attribute (name, type, &u[0]);
+        }
+        return false;
+    }
+    return false;
+}
+
+
+
+bool
+oiio_attribute_tuple_typed (const std::string &name,
+                            TypeDesc type, tuple &obj)
+{
+    if (type.basetype == TypeDesc::INT) {
+        std::vector<int> vals;
+        py_to_stdvector (vals, obj);
+        if (vals.size() == type.numelements()*type.aggregate)
+            return OIIO::attribute (name, type, &vals[0]);
+        return false;
+    }
+    if (type.basetype == TypeDesc::FLOAT) {
+        std::vector<float> vals;
+        py_to_stdvector (vals, obj);
+        if (vals.size() == type.numelements()*type.aggregate)
+            return OIIO::attribute (name, type, &vals[0]);
+        return false;
+    }
+    if (type.basetype == TypeDesc::STRING) {
+        std::vector<std::string> vals;
+        py_to_stdvector (vals, obj);
+        if (vals.size() == type.numelements()*type.aggregate) {
+            std::vector<ustring> u;
+            for (size_t i = 0, e = vals.size(); i < e; ++i)
+                u.push_back (ustring(vals[i]));
+            return OIIO::attribute (name, type, &u[0]);
+        }
+        return false;
+    }
+    return false;
+}
+
+
+
+static object
+oiio_getattribute_typed (const std::string &name, TypeDesc type)
+{
+    if (type == TypeDesc::UNKNOWN)
+        return object();
+    char *data = OIIO_ALLOCA(char, type.size());
+    if (OIIO::getattribute (name, type, data)) {
+        if (type.basetype == TypeDesc::INT) {
+#if PY_MAJOR_VERSION >= 3
+            return C_to_val_or_tuple ((const int *)data, type, PyLong_FromLong);
+#else
+            return C_to_val_or_tuple ((const int *)data, type, PyInt_FromLong);
+#endif
+        }
+        if (type.basetype == TypeDesc::FLOAT) {
+            return C_to_val_or_tuple ((const float *)data, type, PyFloat_FromDouble);
+        }
+        if (type.basetype == TypeDesc::STRING) {
+#if PY_MAJOR_VERSION >= 3
+            return C_to_val_or_tuple ((const char **)data, type, PyUnicode_FromString);
+#else
+            return C_to_val_or_tuple ((const char **)data, type, PyString_FromString);
+#endif
+        }
+    }
+    return object();
+}
+
+
+static int
+oiio_get_int_attribute (const char *name)
+{
+    return OIIO::get_int_attribute (name);
+}
+
+
+static int
+oiio_get_int_attribute_d (const char *name, int defaultval)
+{
+    return OIIO::get_int_attribute (name, defaultval);
+}
+
+
+static float
+oiio_get_float_attribute (const char *name)
+{
+    return OIIO::get_float_attribute (name);
+}
+
+
+static float
+oiio_get_float_attribute_d (const char *name, float defaultval)
+{
+    return OIIO::get_float_attribute (name, defaultval);
+}
+
+
+static std::string
+oiio_get_string_attribute (const char *name)
+{
+    return OIIO::get_string_attribute (name);
+}
+
+
+static std::string
+oiio_get_string_attribute_d (const char *name, const char *defaultval)
+{
+    return OIIO::get_string_attribute (name, defaultval);
+}
+
+
+
+
+
+const void *
+python_array_address (numeric::array &data, TypeDesc &elementtype,
+                      size_t &numelements)
+{
+    // Figure out the type of the array
+    object tcobj = data.attr("typecode");
+    extract<char> tce (tcobj);
+    char typecode = tce.check() ? (char)tce : 0;
+    elementtype = typedesc_from_python_array_code (typecode);
+    if (elementtype == TypeDesc::UNKNOWN)
+        return NULL;
+
+    // TODO: The PyObject_AsReadBuffer is a deprecated API dating from
+    // Python 1.6 (see https://docs.python.org/2/c-api/objbuffer.html). It
+    // still works in 2.x, but for future-proofing, we should switch to the
+    // memory buffer interface:
+    // https://docs.python.org/2/c-api/buffer.html#bufferobjects
+    // https://docs.python.org/3/c-api/buffer.html
+    const void *addr = NULL;
+    Py_ssize_t pylen = 0;
+    int success = PyObject_AsReadBuffer(data.ptr(), &addr, &pylen);
+    if (success != 0) {
+        throw_error_already_set();
+        return NULL;
+    }
+
+    numelements = size_t(pylen) / elementtype.size();
+    return addr;
+}
+
+
+
+// This OIIO_DECLARE_PYMODULE mojo is necessary if we want to pass in the
+// MODULE name as a #define. Google for Argument-Prescan for additional
+// info on why this is necessary
+
+#define OIIO_DECLARE_PYMODULE(x) BOOST_PYTHON_MODULE(x) 
+
+OIIO_DECLARE_PYMODULE(OIIO_PYMODULE_NAME) {
+    // Conversion back and forth to ustring
     boost::python::to_python_converter<
         ustring,
         ustring_to_python_str>();
-
     ustring_from_python_str();
 
-    declare_imageinput();
-    declare_imagespec();
-    declare_imageoutput();
+    // Basic helper classes
     declare_typedesc();
-    declare_imagecache();
-    declare_imagebuf();
     declare_paramvalue();
-	def("progress_callback_example", &progress_callback_wrapper);   
-	def("create_array", &create_array);
-	def("fill_array",   &fill_array);
-	def("print_array",  &print_array);
+    declare_imagespec();
+    declare_roi();
+    declare_deepdata();
+
+    // Main OIIO I/O classes
+    declare_imageinput();
+    declare_imageoutput();
+    declare_imagebuf();
+    declare_imagecache();
+
+    declare_imagebufalgo();
+    
+    // Global (OpenImageIO scope) functions and symbols
+    def("geterror",     &OIIO::geterror);
+    def("attribute",    &oiio_attribute_float);
+    def("attribute",    &oiio_attribute_int);
+    def("attribute",    &oiio_attribute_string);
+    def("attribute",    &oiio_attribute_typed);
+    def("attribute",    &oiio_attribute_tuple_typed);
+    def("get_int_attribute",    &oiio_get_int_attribute);
+    def("get_int_attribute",    &oiio_get_int_attribute_d);
+    def("get_float_attribute",  &oiio_get_float_attribute);
+    def("get_float_attribute",  &oiio_get_float_attribute_d);
+    def("get_string_attribute", &oiio_get_string_attribute);
+    def("get_string_attribute", &oiio_get_string_attribute_d);
+    def("getattribute",         &oiio_getattribute_typed);
+    scope().attr("AutoStride") = AutoStride;
+    scope().attr("openimageio_version") = OIIO_VERSION;
+    scope().attr("VERSION") = OIIO_VERSION;
+    scope().attr("VERSION_STRING") = OIIO_VERSION_STRING;
+    scope().attr("VERSION_MAJOR") = OIIO_VERSION_MAJOR;
+    scope().attr("VERSION_MINOR") = OIIO_VERSION_MINOR;
+    scope().attr("VERSION_PATCH") = OIIO_VERSION_PATCH;
+    scope().attr("INTRO_STRING") = OIIO_INTRO_STRING;
+
+    boost::python::numeric::array::set_module_and_type("array", "array");
 }
 
 } // namespace PyOpenImageIO

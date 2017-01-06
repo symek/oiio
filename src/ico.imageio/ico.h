@@ -31,8 +31,8 @@
 #ifndef OPENIMAGEIO_ICO_H
 #define OPENIMAGEIO_ICO_H
 
-#include "filesystem.h"
-#include "fmath.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/fmath.h"
 
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
@@ -90,7 +90,7 @@ struct ico_header {
 };
 
 
-};  // namespace ICO_pvt
+}  // namespace ICO_pvt
 
 
 OIIO_PLUGIN_NAMESPACE_END

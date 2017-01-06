@@ -31,16 +31,13 @@
 
 #include <iostream>
 
-#include <boost/tokenizer.hpp>
-
-#include "imageio.h"
+#include "OpenImageIO/imageio.h"
 
 #define DEBUG_IPTC_READ  0
 #define DEBUG_IPTC_WRITE 0
 
 
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 namespace {
 
@@ -48,60 +45,70 @@ struct IIMtag {
     int tag;                  // IIM code
     const char *name;         // Attribute name we use
     const char *anothername;  // Optional second name
+    bool repeatable;          // May repeat
 };
 
 static IIMtag iimtag [] = {
-    {   5, "IPTC:ObjectName", NULL },
-    {  15, "IPTC:Category", NULL },
-//    {  25, "Keywords", NULL },
-    {  40, "IPTC:Instructions", NULL },
-    {  65, "IPTC:OriginatingProgram", "Software" },
-    {  80, "IPTC:Creator", "Artist" },   // N.B. in theory, repeatable
-    {  85, "IPTC:AuthorsPosition", NULL },  // N.B. in theory, repeatable
-    {  90, "IPTC:City", NULL },
-    {  92, "IPTC:Sublocation", NULL },
-    {  95, "IPTC:State", NULL },
-    { 100, "IPTC:CountryCode", NULL },
-    { 101, "IPTC:Country", NULL },
-    { 103, "IPTC:TransmissionReference", NULL },
-    { 105, "IPTC:Headline", NULL },
-    { 110, "IPTC:Provider", NULL }, // aka Credit
-    { 115, "IPTC:Source", NULL },
-    { 116, "IPTC:CopyrightNotice", "Copyright" },
-    { 118, "IPTC:Contact", NULL },
-    { 120, "IPTC:Caption", "ImageDescription"},
-    { 122, "IPTC:CaptionWriter", NULL },  // should it be called Writer?
-    { -1, NULL, NULL }
+    {   3, "IPTC:ObjectTypeReference", NULL, false },
+    {   4, "IPTC:ObjectAttributeReference", NULL, true },
+    {   5, "IPTC:ObjectName", NULL, false },
+    {   7, "IPTC:EditStatus", NULL, false },
+    {  10, "IPTC:Urgency", NULL, false },  // deprecated by IPTC
+    {  12, "IPTC:SubjectReference", NULL, true },
+    {  15, "IPTC:Category", NULL, false },
+    {  20, "IPTC:SupplementalCategories", NULL, true }, // deprecated by IPTC
+    {  22, "IPTC:FixtureIdentifier", NULL, false },
+    {  25, "Keywords", NULL, true },
+    {  26, "IPTC:ContentLocationCode", NULL, true },
+    {  27, "IPTC:ContentLocationName", NULL, true },
+    {  30, "IPTC:ReleaseDate", NULL, false },
+    {  35, "IPTC:ReleaseTime", NULL, false },
+    {  37, "IPTC:ExpirationDate", NULL, false },
+    {  38, "IPTC:ExpirationTime", NULL, false },
+    {  40, "IPTC:Instructions", NULL, false },
+    {  45, "IPTC:ReferenceService", NULL, true },
+    {  47, "IPTC:ReferenceDate", NULL, false },
+    {  50, "IPTC:ReferenceNumber", NULL, true },
+    {  55, "IPTC:DateCreated", NULL, false },
+    {  60, "IPTC:TimeCreated", NULL, false },
+    {  62, "IPTC:DigitalCreationDate", NULL, false },
+    {  63, "IPTC:DigitalCreationTime", NULL, false },
+    {  65, "IPTC:OriginatingProgram", "Software", false },
+    {  70, "IPTC:ProgramVersion", NULL, false },
+    {  80, "IPTC:Creator", "Artist", true },  // sometimes called "byline"
+    {  85, "IPTC:AuthorsPosition", NULL, true }, // sometimes "byline title"
+    {  90, "IPTC:City", NULL, false },
+    {  92, "IPTC:Sublocation", NULL, false },
+    {  95, "IPTC:State", NULL, false },  // sometimes "Province/State"
+    { 100, "IPTC:CountryCode", NULL, false },
+    { 101, "IPTC:Country", NULL, false },
+    { 103, "IPTC:TransmissionReference", NULL, false },
+    { 105, "IPTC:Headline", NULL, false },
+    { 110, "IPTC:Provider", NULL, false }, // aka Credit
+    { 115, "IPTC:Source", NULL, false },
+    { 116, "IPTC:CopyrightNotice", "Copyright", false },
+    { 118, "IPTC:Contact", NULL, false },
+    { 120, "IPTC:Caption", "ImageDescription", false},
+    { 121, "IPTC:LocalCaption", NULL, false},
+    { 122, "IPTC:CaptionWriter", NULL, false },  // aka Writer/Editor
+    // Note: 150-154 is audio sampling stuff
+    { 184, "IPTC:JobID", NULL, false },
+    { 185, "IPTC:MasterDocumentID", NULL, false },
+    { 186, "IPTC:ShortDocumentID", NULL, false },
+    { 187, "IPTC:UniqueDocumentID", NULL, false },
+    { 188, "IPTC:OwnerID", NULL, false },
+    { 221, "IPTC:Prefs", NULL, false },
+    { 225, "IPTC:ClassifyState", NULL, false },
+    { 228, "IPTC:SimilarityIndex", NULL, false },
+    { 230, "IPTC:DocumentNotes", NULL, false },
+    { 231, "IPTC:DocumentHistory", NULL, false },
+    { -1, NULL, NULL, false }
 };
 
-// FIXME? others:
-// 20 SupplementalCategories (repeatable) [ deprecated by IPTC ]
-// 30 ReleaseDate
-// 35 ReleaseTime
-// 37 ExpirationDate
-// 38 ExpirationTime
-// 45 ReferenceService
-// 47 ReferenceDate
-// 50 ReferenceNumber
-// 55 DateCreated (CCYYMMDD, 00 for unknown parts)
-// 60 TimeCreated [11 digs]
-// 62 DigitalCreationDate [8 digs]
-// 63 DigitalCreationTime [11 digs]
-// 70 ProgramVersion
-// 121 LocalCaption
-// 150-154 audio stuff
-// 184 JobID
-// 185 MasterDocumentID
-// 186 ShortDocumentID
-// 187 UniqueDocumentID
-// 188 OwnerID
-// 221 Prefs
-// 225 ClassifyState
-// 228 SimilarityIndex
-// 230 DocumentNotes
-// 231 DocumentHistory
+// N.B. All "Date" fields are 8 digit strings: CCYYMMDD
+// All "Time" fields are 11 digit strings (what format?)
 
-};   // anonymous namespace
+}   // anonymous namespace
 
 
 
@@ -119,8 +126,6 @@ decode_iptc_iim (const void *iptc, int length, ImageSpec &spec)
     }
     std::cerr << "\n";
 #endif
-
-    std::string keywords;
 
     // Now there are a series of data blocks.  Each one starts with 1C
     // 02, then a single byte indicating the tag type, then 2 byte (big
@@ -150,26 +155,29 @@ decode_iptc_iim (const void *iptc, int length, ImageSpec &spec)
 
             for (int i = 0;  iimtag[i].name;  ++i) {
                 if (tagtype == iimtag[i].tag) {
-                    spec.attribute (iimtag[i].name, s);
+                    if (iimtag[i].repeatable) {
+                        // For repeatable IIM tags, concatenate them
+                        // together separated by semicolons
+                        s = Strutil::strip (s);
+                        std::string old = spec.get_string_attribute (iimtag[i].name);
+                        if (old.size())
+                            old += "; ";
+                        spec.attribute (iimtag[i].name, old+s);
+                    } else {
+                        spec.attribute (iimtag[i].name, s);
+                    }
                     if (iimtag[i].anothername)
                         spec.attribute (iimtag[i].anothername, s);
+                    break;
                 }
             }
 
-            // Special case for keywords
-            if (tagtype == 25) {
-                if (keywords.length())
-                    keywords.append (std::string("; "));
-                keywords.append (s);
-            }
         }
 
         buf += tagsize;
         length -= tagsize;
     }
 
-    if (keywords.length())
-        spec.attribute ("Keywords", keywords);
     return true;
 }
 
@@ -185,6 +193,7 @@ encode_iptc_iim_one_tag (int tag, const char *name, TypeDesc type,
         iptc.push_back ((char)tag);
         const char *str = ((const char **)data)[0];
         int tagsize = strlen(str);
+        tagsize = std::min (tagsize, 0xffff - 1); // Prevent 16 bit overflow
         iptc.push_back ((char)(tagsize >> 8));
         iptc.push_back ((char)(tagsize & 0xff));
         iptc.insert (iptc.end(), str, str+tagsize);
@@ -200,36 +209,32 @@ encode_iptc_iim (const ImageSpec &spec, std::vector<char> &iptc)
     
     const ImageIOParameter *p;
     for (int i = 0;  iimtag[i].name;  ++i) {
-        if ((p = spec.find_attribute (iimtag[i].name)))
-            encode_iptc_iim_one_tag (iimtag[i].tag, iimtag[i].name,
-                                     p->type(), p->data(), iptc);
+        if ((p = spec.find_attribute (iimtag[i].name))) {
+            if (iimtag[i].repeatable) {
+                std::string allvals (*(const char **)p->data());
+                std::vector<std::string> tokens;
+                Strutil::split (allvals, tokens, ";");
+                for (size_t t = 0, e = tokens.size();  t < e;  ++t) {
+                    tokens[t] = Strutil::strip (tokens[t]);
+                    if (tokens[t].size()) {
+                        const char *tok = &tokens[t][0];
+                        encode_iptc_iim_one_tag (iimtag[i].tag, iimtag[i].name,
+                                                 p->type(), &tok, iptc);
+                    }
+                }
+            } else {
+                // Regular, non-repeating
+                encode_iptc_iim_one_tag (iimtag[i].tag, iimtag[i].name,
+                                         p->type(), p->data(), iptc);
+            }
+        }
         if (iimtag[i].anothername) {
             if ((p = spec.find_attribute (iimtag[i].anothername)))
                 encode_iptc_iim_one_tag (iimtag[i].tag, iimtag[i].anothername,
                                          p->type(), p->data(), iptc);
         }
     }
-
-    // Special case: Keywords
-    if ((p = spec.find_attribute ("Keywords", TypeDesc::STRING))) {
-        std::string allkeywords (*(const char **)p->data());
-        typedef boost::tokenizer<boost::char_separator<char> > tokenizer;
-        boost::char_separator<char> sep(";");
-        tokenizer tokens (allkeywords, sep);
-        for (tokenizer::iterator tok_iter = tokens.begin();
-                 tok_iter != tokens.end(); ++tok_iter) {
-            std::string t = *tok_iter;
-            while (t.size() && t[0] == ' ')
-                t.erase (t.begin());
-            if (t.size()) {
-                const char *tptr = &t[0];
-                encode_iptc_iim_one_tag (25 /* tag number */, "Keywords",
-                                         TypeDesc::STRING, &tptr, iptc);
-            }
-        }
-    }
 }
 
 
-}
-OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END

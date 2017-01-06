@@ -34,21 +34,20 @@
 #include <iostream>
 #include <string>
 
-#include "strutil.h"
-#include "errorhandler.h"
-#include "thread.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/errorhandler.h"
+#include "OpenImageIO/thread.h"
 
 
 
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 
 
 namespace {
 static ErrorHandler default_handler_instance;
 static mutex err_mutex;
-};
+}
 
 
 ErrorHandler &
@@ -105,7 +104,7 @@ ErrorHandler::vMessage (const char *format, va_list argptr)
 }
 
 
-#ifdef DEBUG
+#ifndef NDEBUG
 void
 ErrorHandler::vDebug (const char *format, va_list argptr)
 {
@@ -175,7 +174,7 @@ ErrorHandler::message (const char *format, ...)
 
 
 
-#ifdef DEBUG
+#ifndef NDEBUG
 void
 ErrorHandler::debug (const char *format, ...)
 {
@@ -210,7 +209,7 @@ ErrorHandler::operator() (int errcode, const std::string &msg)
         fprintf (stderr, "SEVERE ERROR: %s\n", msg.c_str());
         break;
     case EH_DEBUG :
-#ifndef DEBUG
+#ifdef NDEBUG
         break;
 #endif
     default :
@@ -222,5 +221,4 @@ ErrorHandler::operator() (int errcode, const std::string &msg)
     fflush (stderr);
 }
 
-}
-OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END

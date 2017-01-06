@@ -32,18 +32,32 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <memory>
 
-#include "dassert.h"
-#include "typedesc.h"
-#include "strutil.h"
-#include "fmath.h"
-
-#include "imageio.h"
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/typedesc.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/fmath.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/deepdata.h"
 #include "imageio_pvt.h"
 
-OIIO_NAMESPACE_ENTER
-{
+
+OIIO_NAMESPACE_BEGIN
     using namespace pvt;
+
+
+
+ImageInput::ImageInput ()
+    : m_threads(0)
+{
+}
+
+
+
+ImageInput::~ImageInput ()
+{
+}
 
 
 
@@ -166,13 +180,14 @@ ImageInput::read_scanlines (int ybegin, int yend, int z,
 
 bool
 ImageInput::read_scanlines (int ybegin, int yend, int z,
-                            int firstchan, int nchans,
+                            int chbegin, int chend,
                             TypeDesc format, void *data,
                             stride_t xstride, stride_t ystride)
 {
-    nchans = std::min (nchans, m_spec.nchannels-firstchan);
+    chend = clamp (chend, chbegin+1, m_spec.nchannels);
+    int nchans = chend - chbegin;
     yend = std::min (yend, spec().y+spec().height);
-    size_t native_pixel_bytes = m_spec.pixel_bytes (firstchan, nchans, true);
+    size_t native_pixel_bytes = m_spec.pixel_bytes (chbegin, chend, true);
     imagesize_t native_scanline_bytes = clamped_mult64 ((imagesize_t)m_spec.width,
                                                         (imagesize_t)native_pixel_bytes);
     bool native = (format == TypeDesc::UNKNOWN);
@@ -189,24 +204,23 @@ ImageInput::read_scanlines (int ybegin, int yend, int z,
     bool rightformat = (format == TypeDesc::UNKNOWN) ||
         (format == m_spec.format && m_spec.channelformats.empty());
     if (rightformat && contiguous) {
-        if (firstchan == 0 && nchans == m_spec.nchannels)
+        if (chbegin == 0 && chend == m_spec.nchannels)
             return read_native_scanlines (ybegin, yend, z, data);
         else
-            return read_native_scanlines (ybegin, yend, z,
-                                          firstchan, nchans, data);
+            return read_native_scanlines (ybegin, yend, z, chbegin, chend, data);
     }
 
     // No such luck.  Read scanlines in chunks.
 
     const imagesize_t limit = 16*1024*1024;   // Allocate 16 MB, or 1 scanline
     int chunk = std::max (1, int(limit / native_scanline_bytes));
-    std::vector<unsigned char> buf (chunk * native_scanline_bytes);
+    std::unique_ptr<char[]> buf (new char [chunk * native_scanline_bytes]);
 
     bool ok = true;
     int scanline_values = m_spec.width * nchans;
     for (;  ok && ybegin < yend;  ybegin += chunk) {
         int y1 = std::min (ybegin+chunk, yend);
-        ok &= read_native_scanlines (ybegin, y1, z, firstchan, nchans, &buf[0]);
+        ok &= read_native_scanlines (ybegin, y1, z, chbegin, chend, &buf[0]);
         if (! ok)
             break;
 
@@ -217,21 +231,30 @@ ImageInput::read_scanlines (int ybegin, int yend, int z,
             if (contiguous) {
                 ok = convert_types (m_spec.format, &buf[0], format, data, chunkvalues);
             } else {
-                ok = convert_image (nchans, m_spec.width, nscanlines, 1, 
+                ok = parallel_convert_image (nchans, m_spec.width, nscanlines, 1, 
                                     &buf[0], m_spec.format, AutoStride, AutoStride, AutoStride,
-                                    data, format, xstride, ystride, zstride);
+                                    data, format, xstride, ystride, zstride,
+                                    -1 /*alpha*/, -1 /*z*/, threads());
             }
         } else {
             // Per-channel formats -- have to convert/copy channels individually
             size_t offset = 0;
-            for (int c = 0;  ok && c < nchans;  ++c) {
-                TypeDesc chanformat = m_spec.channelformats[c+firstchan];
-                ok = convert_image (1 /* channels */, m_spec.width, nscanlines, 1, 
-                                    &buf[offset], chanformat, 
+            int n = 1;
+            for (int c = 0;  ok && c < nchans; c += n) {
+                TypeDesc chanformat = m_spec.channelformats[c+chbegin];
+                // Try to do more than one channel at a time to improve
+                // memory coherence, if there are groups of adjacent
+                // channels needing the same data conversion.
+                for (n = 1; c+n < nchans; ++n)
+                    if (m_spec.channelformats[c+chbegin+n] != chanformat)
+                        break;
+                ok = parallel_convert_image (n /* channels */, m_spec.width, nscanlines, 1, 
+                                    &buf[offset], chanformat,
                                     native_pixel_bytes, AutoStride, AutoStride,
                                     (char *)data + c*format.size(),
-                                    format, xstride, ystride, zstride);
-                offset += chanformat.size ();
+                                    format, xstride, ystride, zstride,
+                                    -1 /*alpha*/, -1 /*z*/, threads());
+                offset += n * chanformat.size ();
             }
         }
         if (! ok)
@@ -266,22 +289,22 @@ ImageInput::read_native_scanlines (int ybegin, int yend, int z, void *data)
 
 bool
 ImageInput::read_native_scanlines (int ybegin, int yend, int z,
-                                   int firstchan, int nchans, void *data)
+                                   int chbegin, int chend, void *data)
 {
     // All-channel case just reduces to the simpler read_native_scanlines.
-    if (firstchan == 0 && nchans >= m_spec.nchannels)
+    if (chbegin == 0 && chend >= m_spec.nchannels)
         return read_native_scanlines (ybegin, yend, z, data);
 
     // Base class implementation of read_native_scanlines (with channel
     // subset) just calls read_native_scanlines (all channels), and
     // copies the appropriate subset.
-    size_t prefix_bytes = m_spec.pixel_bytes (0,firstchan,true);
-    size_t subset_bytes = m_spec.pixel_bytes (firstchan,nchans,true);
+    size_t prefix_bytes = m_spec.pixel_bytes (0,chbegin,true);
+    size_t subset_bytes = m_spec.pixel_bytes (chbegin,chend,true);
     size_t subset_ystride = m_spec.width * subset_bytes;
 
     size_t native_pixel_bytes = m_spec.pixel_bytes (true);
     size_t native_ystride = m_spec.width * native_pixel_bytes;
-    std::vector<char> buf (native_ystride);
+    std::unique_ptr<char[]> buf (new char [native_ystride]);
     yend = std::min (yend, spec().y+spec().height);
     for (int y = ybegin;  y < yend;  ++y) {
         bool ok = read_native_scanline (y, z, &buf[0]);
@@ -333,7 +356,7 @@ ImageInput::read_tile (int x, int y, int z, TypeDesc format, void *data,
     // Complex case -- either changing data type or stride
     size_t tile_values = (size_t)m_spec.tile_pixels() * m_spec.nchannels;
 
-    std::vector<char> buf (m_spec.tile_bytes(true));
+    std::unique_ptr<char[]> buf (new char [m_spec.tile_bytes(true)]);
     bool ok = read_native_tile (x, y, z, &buf[0]);
     if (! ok)
         return false;
@@ -384,17 +407,18 @@ ImageInput::read_tiles (int xbegin, int xend, int ybegin, int yend,
 bool 
 ImageInput::read_tiles (int xbegin, int xend, int ybegin, int yend,
                         int zbegin, int zend, 
-                        int firstchan, int nchans,
+                        int chbegin, int chend,
                         TypeDesc format, void *data,
                         stride_t xstride, stride_t ystride, stride_t zstride)
 {
     if (! m_spec.valid_tile_range (xbegin, xend, ybegin, yend, zbegin, zend))
         return false;
 
-    nchans = std::min (nchans, m_spec.nchannels-firstchan);
+    chend = clamp (chend, chbegin+1, m_spec.nchannels);
+    int nchans = chend - chbegin;
     // native_pixel_bytes is the size of a pixel in the FILE, including
     // the per-channel format.
-    stride_t native_pixel_bytes = (stride_t) m_spec.pixel_bytes (firstchan, nchans, true);
+    stride_t native_pixel_bytes = (stride_t) m_spec.pixel_bytes (chbegin, chend, true);
     // perchanfile is true if the file has different per-channel formats
     bool perchanfile = m_spec.channelformats.size();
     // native_data is true if the user asking for data in the native format
@@ -422,12 +446,12 @@ ImageInput::read_tiles (int xbegin, int xend, int ybegin, int yend,
         (xend-xbegin) == nxtiles*m_spec.tile_width &&
         (yend-ybegin) == nytiles*m_spec.tile_height &&
         (zend-zbegin) == nztiles*m_spec.tile_depth) {
-        if (firstchan == 0 && nchans == m_spec.nchannels)
+        if (chbegin == 0 && chend == m_spec.nchannels)
             return read_native_tiles (xbegin, xend, ybegin, yend, zbegin, zend,
                                       data);  // Simple case
         else
             return read_native_tiles (xbegin, xend, ybegin, yend, zbegin, zend,
-                                      firstchan, nchans, data);
+                                      chbegin, chend, data);
     }
 
     // No such luck.  Just punt and read tiles individually.
@@ -439,7 +463,7 @@ ImageInput::read_tiles (int xbegin, int xend, int ybegin, int yend,
     stride_t full_tilewidthbytes = full_pixelsize * m_spec.tile_width;
     stride_t full_tilewhbytes = full_tilewidthbytes * m_spec.tile_height;
     stride_t full_tilebytes = full_tilewhbytes * m_spec.tile_depth;
-    size_t prefix_bytes = m_spec.pixel_bytes (0,firstchan,true);
+    size_t prefix_bytes = m_spec.pixel_bytes (0,chbegin,true);
     std::vector<char> buf;
     for (int z = zbegin;  z < zend;  z += std::max(1,m_spec.tile_depth)) {
         int zd = std::min (zend-z, m_spec.tile_depth);
@@ -455,15 +479,16 @@ ImageInput::read_tiles (int xbegin, int xend, int ybegin, int yend,
                 // then copied.
                 if (xw == m_spec.tile_width && yh == m_spec.tile_height &&
                       zd == m_spec.tile_depth && !perchanfile &&
-                      firstchan == 0 && nchans == m_spec.nchannels) {
+                      chbegin == 0 && chend == m_spec.nchannels) {
                     // Full tile, either native data or not needing
                     // per-tile data format conversion.
                     ok &= read_tile (x, y, z, format, tilestart,
                                      xstride, ystride, zstride);
+                    if (! ok)
+                        return false;
                 } else {
                     buf.resize (full_tilebytes);
-                    ok &= read_tile (x, y, z, 
-                                     perchanfile ? TypeDesc::UNKNOWN : format,
+                    ok &= read_tile (x, y, z, format,
                                      &buf[0], full_pixelsize,
                                      full_tilewidthbytes, full_tilewhbytes);
                     if (ok)
@@ -509,7 +534,7 @@ ImageInput::read_native_tiles (int xbegin, int xend, int ybegin, int yend,
     stride_t tilezstride = tileystride * m_spec.tile_height;
     stride_t ystride = (xend-xbegin) * pixel_bytes;
     stride_t zstride = (yend-ybegin) * ystride;
-    std::vector<char> pels (m_spec.tile_bytes(true));
+    std::unique_ptr<char[]> pels (new char [m_spec.tile_bytes(true)]);
     for (int z = zbegin;  z < zend;  z += m_spec.tile_depth) {
         for (int y = ybegin;  y < yend;  y += m_spec.tile_height) {
             for (int x = xbegin;  x < xend;  x += m_spec.tile_width) {
@@ -534,10 +559,13 @@ ImageInput::read_native_tiles (int xbegin, int xend, int ybegin, int yend,
 bool
 ImageInput::read_native_tiles (int xbegin, int xend, int ybegin, int yend,
                                int zbegin, int zend, 
-                               int firstchan, int nchans, void *data)
+                               int chbegin, int chend, void *data)
 {
+    chend = clamp (chend, chbegin+1, m_spec.nchannels);
+    int nchans = chend - chbegin;
+
     // All-channel case just reduces to the simpler read_native_scanlines.
-    if (firstchan == 0 && nchans >= m_spec.nchannels)
+    if (chbegin == 0 && chend >= m_spec.nchannels)
         return read_native_tiles (xbegin, xend, ybegin, yend,
                                   zbegin, zend, data);
 
@@ -553,12 +581,12 @@ ImageInput::read_native_tiles (int xbegin, int xend, int ybegin, int yend,
     stride_t native_tileystride = native_pixel_bytes * m_spec.tile_width;
     stride_t native_tilezstride = native_tileystride * m_spec.tile_height;
 
-    size_t prefix_bytes = m_spec.pixel_bytes (0,firstchan,true);
-    size_t subset_bytes = m_spec.pixel_bytes (firstchan,nchans,true);
+    size_t prefix_bytes = m_spec.pixel_bytes (0,chbegin,true);
+    size_t subset_bytes = m_spec.pixel_bytes (chbegin,chend,true);
     stride_t subset_ystride = (xend-xbegin) * subset_bytes;
     stride_t subset_zstride = (yend-ybegin) * subset_ystride;
 
-    std::vector<char> pels (m_spec.tile_bytes(true));
+    std::unique_ptr<char[]> pels (new char [m_spec.tile_bytes(true)]);
     for (int z = zbegin;  z < zend;  z += m_spec.tile_depth) {
         for (int y = ybegin;  y < yend;  y += m_spec.tile_height) {
             for (int x = xbegin;  x < xend;  x += m_spec.tile_width) {
@@ -588,12 +616,28 @@ ImageInput::read_image (TypeDesc format, void *data,
                         ProgressCallback progress_callback,
                         void *progress_callback_data)
 {
+    return read_image (0, -1, format, data, xstride, ystride, zstride,
+                       progress_callback, progress_callback_data);
+}
+
+
+
+bool
+ImageInput::read_image (int chbegin, int chend, TypeDesc format, void *data,
+                        stride_t xstride, stride_t ystride, stride_t zstride,
+                        ProgressCallback progress_callback,
+                        void *progress_callback_data)
+{
+    if (chend < 0)
+        chend = m_spec.nchannels;
+    chend = clamp (chend, chbegin+1, m_spec.nchannels);
+    int nchans = chend - chbegin;
     bool native = (format == TypeDesc::UNKNOWN);
-    stride_t pixel_bytes = native ? (stride_t) m_spec.pixel_bytes (native)
-                                  : (stride_t) (format.size()*m_spec.nchannels);
+    stride_t pixel_bytes = native ? (stride_t) m_spec.pixel_bytes (chbegin, chend, native)
+                                  : (stride_t) (format.size()*nchans);
     if (native && xstride == AutoStride)
         xstride = pixel_bytes;
-    m_spec.auto_stride (xstride, ystride, zstride, format, m_spec.nchannels,
+    m_spec.auto_stride (xstride, ystride, zstride, format, nchans,
                         m_spec.width, m_spec.height);
     bool ok = true;
     if (progress_callback)
@@ -606,6 +650,7 @@ ImageInput::read_image (TypeDesc format, void *data,
                 ok &= read_tiles (m_spec.x, m_spec.x+m_spec.width,
                                   y+m_spec.y, std::min (y+m_spec.y+m_spec.tile_height, m_spec.y+m_spec.height),
                                   z+m_spec.z, std::min (z+m_spec.z+m_spec.tile_depth, m_spec.z+m_spec.depth),
+                                  chbegin, chend,
                                   format, (char *)data + z*zstride + y*ystride,
                                   xstride, ystride, zstride);
                 if (progress_callback &&
@@ -614,12 +659,16 @@ ImageInput::read_image (TypeDesc format, void *data,
             }
         }
     } else {
-        // Scanline image -- rely on read_scanlines, in chunks of 64
-        const int chunk = 256;
+        // Scanline image -- rely on read_scanlines, in chunks of oiio_read_chunk
+        int read_chunk = oiio_read_chunk;
+        if (!read_chunk) {
+            read_chunk = m_spec.height;
+        }
         for (int z = 0;  z < m_spec.depth;  ++z)
-            for (int y = 0;  y < m_spec.height && ok;  y += chunk) {
-                int yend = std::min (y+m_spec.y+chunk, m_spec.y+m_spec.height);
-                ok &= read_scanlines (y+m_spec.y, yend, z+m_spec.z, format,
+            for (int y = 0;  y < m_spec.height && ok;  y += read_chunk) {
+                int yend = std::min (y+m_spec.y+read_chunk, m_spec.y+m_spec.height);
+                ok &= read_scanlines (y+m_spec.y, yend, z+m_spec.z,
+                                      chbegin, chend, format,
                                       (char *)data + z*zstride + y*ystride,
                                       xstride, ystride);
                 if (progress_callback)
@@ -636,7 +685,7 @@ ImageInput::read_image (TypeDesc format, void *data,
 
 bool
 ImageInput::read_native_deep_scanlines (int ybegin, int yend, int z,
-                                        int firstchan, int nchans,
+                                        int chbegin, int chend,
                                         DeepData &deepdata)
 {
     return false;  // default: doesn't support deep images
@@ -648,7 +697,7 @@ bool
 ImageInput::read_native_deep_tiles (int xbegin, int xend,
                                     int ybegin, int yend,
                                     int zbegin, int zend,
-                                    int firstchan, int nchans,
+                                    int chbegin, int chend,
                                     DeepData &deepdata)
 {
     return false;  // default: doesn't support deep images
@@ -715,5 +764,4 @@ ImageInput::read_native_tile (int x, int y, int z, void * data)
     return false;
 }
 
-}
-OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END

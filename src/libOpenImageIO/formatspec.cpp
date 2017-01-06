@@ -32,38 +32,34 @@
 #include <cstdlib>
 #include <sstream>
 
-#include <half.h>
+#include <OpenEXR/half.h>
+#include <OpenEXR/ImfTimeCode.h>
 
-#include <boost/tokenizer.hpp>
-#include <boost/foreach.hpp>
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/typedesc.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/fmath.h"
+#include "OpenImageIO/imageio.h"
+#include "imageio_pvt.h"
 
-#include "dassert.h"
-#include "typedesc.h"
-#include "strutil.h"
-#include "fmath.h"
+#if USE_EXTERNAL_PUGIXML
+# include "pugixml.hpp"
+#else
+# include "OpenImageIO/pugixml.hpp"
+#endif
 
-#include "imageio.h"
-#include "pugixml.hpp"
-
-
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 // Generate the default quantization parameters, templated on the data
 // type.
 template <class T>
-static void
-set_default_quantize (int &quant_black, int &quant_white,
-                      int &quant_min, int &quant_max)
+inline void
+get_default_quantize_ (long long &quant_min, long long &quant_max)
 {
     if (std::numeric_limits <T>::is_integer) {
-        quant_black  = 0;
-        quant_white  = (int) std::numeric_limits <T>::max();
-        quant_min    = (int) std::numeric_limits <T>::min();
-        quant_max    = (int) std::numeric_limits <T>::max();
+        quant_min    = (long long) std::numeric_limits <T>::min();
+        quant_max    = (long long) std::numeric_limits <T>::max();
     } else {
-        quant_black  = 0;
-        quant_white  = 0;
         quant_min    = 0;
         quant_max    = 0;
     }
@@ -71,60 +67,48 @@ set_default_quantize (int &quant_black, int &quant_white,
 
 
 
-// Given the format, set the default quantization parameters.
+// Given the format, set the default quantization range.
 // Rely on the template version to make life easy.
-static void
-set_default_quantize (TypeDesc format,
-                      int &quant_black, int &quant_white,
-                      int &quant_min, int &quant_max)
+void
+pvt::get_default_quantize (TypeDesc format,
+                           long long &quant_min, long long &quant_max)
 {
     switch (format.basetype) {
-    case TypeDesc::INT8:
-        set_default_quantize <char> (quant_black, quant_white,
-                                     quant_min, quant_max);
-        break;
     case TypeDesc::UNKNOWN:
     case TypeDesc::UINT8:
-        set_default_quantize <unsigned char> (quant_black, quant_white,
-                                     quant_min, quant_max);
-        break;
-    case TypeDesc::INT16:
-        set_default_quantize <short> (quant_black, quant_white,
-                                     quant_min, quant_max);
+        get_default_quantize_ <unsigned char> (quant_min, quant_max);
         break;
     case TypeDesc::UINT16:
-        set_default_quantize <unsigned short> (quant_black, quant_white,
-                                     quant_min, quant_max);
-        break;
-    case TypeDesc::INT:
-        set_default_quantize <int> (quant_black, quant_white,
-                                     quant_min, quant_max);
-        break;
-    case TypeDesc::UINT:
-        set_default_quantize <unsigned int> (quant_black, quant_white,
-                                     quant_min, quant_max);
-        break;
-    case TypeDesc::INT64:
-        set_default_quantize <long long> (quant_black, quant_white,
-                                     quant_min, quant_max);
-        break;
-    case TypeDesc::UINT64:
-        set_default_quantize <unsigned long long> (quant_black, quant_white,
-                                     quant_min, quant_max);
+        get_default_quantize_ <unsigned short> (quant_min, quant_max);
         break;
     case TypeDesc::HALF:
-        set_default_quantize <half> (quant_black, quant_white,
-                                     quant_min, quant_max);
+        get_default_quantize_ <half> (quant_min, quant_max);
         break;
     case TypeDesc::FLOAT:
-        set_default_quantize <float> (quant_black, quant_white,
-                                     quant_min, quant_max);
+        get_default_quantize_ <float> (quant_min, quant_max);
+        break;
+    case TypeDesc::INT8:
+        get_default_quantize_ <char> (quant_min, quant_max);
+        break;
+    case TypeDesc::INT16:
+        get_default_quantize_ <short> (quant_min, quant_max);
+        break;
+    case TypeDesc::INT:
+        get_default_quantize_ <int> (quant_min, quant_max);
+        break;
+    case TypeDesc::UINT:
+        get_default_quantize_ <unsigned int> (quant_min, quant_max);
+        break;
+    case TypeDesc::INT64:
+        get_default_quantize_ <long long> (quant_min, quant_max);
+        break;
+    case TypeDesc::UINT64:
+        get_default_quantize_ <unsigned long long> (quant_min, quant_max);
         break;
     case TypeDesc::DOUBLE:
-        set_default_quantize <double> (quant_black, quant_white,
-                                     quant_min, quant_max);
+        get_default_quantize_ <double> (quant_min, quant_max);
         break;
-    default: ASSERT(0);
+    default: ASSERT_MSG (0, "Unknown data format %d", format.basetype);
     }
 }
 
@@ -138,7 +122,6 @@ ImageSpec::ImageSpec (TypeDesc format)
       nchannels(0), format(format), alpha_channel(-1), z_channel(-1),
       deep(false)
 {
-    set_format (format);
 }
 
 
@@ -151,7 +134,6 @@ ImageSpec::ImageSpec (int xres, int yres, int nchans, TypeDesc format)
       nchannels(nchans), format(format), alpha_channel(-1), z_channel(-1),
       deep(false)
 {
-    set_format (format);
     default_channel_names ();
 }
 
@@ -161,44 +143,7 @@ void
 ImageSpec::set_format (TypeDesc fmt)
 {
     format = fmt;
-    set_default_quantize (fmt, quant_black, quant_white,
-                          quant_min, quant_max);
-}
-
-
-
-TypeDesc
-ImageSpec::format_from_quantize (int quant_black, int quant_white,
-                                 int quant_min, int quant_max)
-{
-    if (quant_black == 0 && quant_white == 0 && 
-        quant_min == 0 && quant_max == 0) {
-        // Per RenderMan and Gelato heuristics, if all quantization
-        // values are zero, assume they want a float output.
-        return TypeDesc::FLOAT;
-    } else if (quant_min >= std::numeric_limits <unsigned char>::min() && 
-               quant_max <= std::numeric_limits <unsigned char>::max()) {
-        return TypeDesc::UINT8;
-    } else if (quant_min >= std::numeric_limits <char>::min() && 
-               quant_max <= std::numeric_limits <char>::max()) {
-        return TypeDesc::INT8;
-    } else if (quant_min >= std::numeric_limits <unsigned short>::min() && 
-               quant_max <= std::numeric_limits <unsigned short>::max()) {
-        return TypeDesc::UINT16;
-    } else if (quant_min >= std::numeric_limits <short>::min() && 
-               quant_max <= std::numeric_limits <short>::max()) {
-        return TypeDesc::INT16;
-    } else if (quant_min >= std::numeric_limits <int>::min() && 
-               quant_max <= std::numeric_limits <int>::max()) {
-        return TypeDesc::INT;
-    } else if (quant_min >= 0 && 
-               (unsigned int) quant_min >= std::numeric_limits <unsigned int>::min() && 
-               quant_max >= 0 &&
-               (unsigned int) quant_max <= std::numeric_limits <unsigned int>::max()) {
-        return TypeDesc::UINT;
-    } else {
-        return TypeDesc::UNKNOWN;
-    }
+    channelformats.clear ();
 }
 
 
@@ -207,37 +152,26 @@ void
 ImageSpec::default_channel_names ()
 {
     channelnames.clear();
+    channelnames.reserve (nchannels);
     alpha_channel = -1;
     z_channel = -1;
-    switch (nchannels) {
-    case 1:
-        channelnames.push_back ("A");
-        break;
-    case 2:
-        channelnames.push_back ("I");
-        channelnames.push_back ("A");
-        alpha_channel = 1;
-        break;
-    case 3:
-        channelnames.push_back ("R");
-        channelnames.push_back ("G");
-        channelnames.push_back ("B");
-        break;
-    default:
-        if (nchannels >= 1)
-            channelnames.push_back ("R");
-        if (nchannels >= 2)
-            channelnames.push_back ("G");
-        if (nchannels >= 3)
-            channelnames.push_back ("B");
-        if (nchannels >= 4) {
-            channelnames.push_back ("A");
-            alpha_channel = 3;
-        }
-        for (int c = 4;  c < nchannels;  ++c)
-            channelnames.push_back (Strutil::format("channel%d", c));
-        break;
+    if (nchannels == 1) {   // Special case: 1-channel is named "Y"
+        channelnames.push_back ("Y");
+        return;
     }
+    // General case: name channels R, G, B, A, channel4, channel5, ...
+    if (nchannels >= 1)
+        channelnames.push_back ("R");
+    if (nchannels >= 2)
+        channelnames.push_back ("G");
+    if (nchannels >= 3)
+        channelnames.push_back ("B");
+    if (nchannels >= 4) {
+        channelnames.push_back ("A");
+        alpha_channel = 3;
+    }
+    for (int c = 4;  c < nchannels;  ++c)
+        channelnames.push_back (Strutil::format("channel%d", c));
 }
 
 
@@ -273,16 +207,16 @@ ImageSpec::pixel_bytes (bool native) const
 
 
 size_t
-ImageSpec::pixel_bytes (int firstchan, int nchans, bool native) const
+ImageSpec::pixel_bytes (int chbegin, int chend, bool native) const
 {
-    nchans = std::min (nchans, nchannels-firstchan);
-    if (nchans < 0 || firstchan < 0)
+    if (chbegin < 0)
         return 0;
+    chend = std::max (chend, chbegin);
     if (!native || channelformats.empty())
-        return clamped_mult32 ((size_t)nchans, channel_bytes());
+        return clamped_mult32 ((size_t)(chend-chbegin), channel_bytes());
     else {
         size_t sum = 0;
-        for (int i = firstchan, e = firstchan+nchans;  i < e;  ++i)
+        for (int i = chbegin; i < chend;  ++i)
             sum += channelformats[i].size();
         return sum;
     }
@@ -344,7 +278,7 @@ ImageSpec::image_bytes (bool native) const
 
 
 void
-ImageSpec::attribute (const std::string &name, TypeDesc type, const void *value)
+ImageSpec::attribute (string_view name, TypeDesc type, const void *value)
 {
     // Don't allow duplicates
     ImageIOParameter *f = find_attribute (name);
@@ -359,56 +293,54 @@ ImageSpec::attribute (const std::string &name, TypeDesc type, const void *value)
 
 template <class T>
 static void
-parse_elements (const std::string &name, TypeDesc type, const std::string &type_code,
-     const std::string &elements, int num_elements, ImageIOParameter &param)
+parse_elements (string_view name, TypeDesc type, const char *type_code,
+                string_view value, ImageIOParameter &param)
 {
-    void *data = new T[num_elements];
-    char *data_ptr = (char *) data;
-    size_t element_size = type.elementtype().elementsize ();
-
-    boost::char_separator<char> sep (", ");
-    boost::tokenizer<boost::char_separator<char> > tokens (elements, sep);
-    BOOST_FOREACH (std::string element, tokens) {
-        sscanf (element.c_str (), type_code.c_str (), (T *)data_ptr);
-        data_ptr += element_size;
+    int num_items = type.numelements() * type.aggregate;
+    T *data = (T*) param.data();
+    // Erase any leading whitespace
+    value.remove_prefix (value.find_first_not_of (" \t"));
+    for (int i = 0;  i < num_items;  ++i) {
+        // Make a temporary copy so we for sure have a 0-terminated string.
+        std::string temp = value;
+        // Grab the first value from it
+        sscanf (temp.c_str(), type_code, &data[i]);
+        // Skip the value (eat until we find a delimiter -- space, comma, tab)
+        value.remove_prefix (value.find_first_of (" ,\t"));
+        // Skip the delimiter
+        value.remove_prefix (value.find_first_not_of (" ,\t"));
+        if (value.empty())
+            break;   // done if nothing left to parse
     }
-
-    param.init (name, type, num_elements/type.numelements (), data, true);
-    delete [] (T *) data;
 }
 
 
 
 void
-ImageSpec::attribute (const std::string &name, TypeDesc type, const std::string &value)
+ImageSpec::attribute (string_view name, TypeDesc type, string_view value)
 {
-    ImageIOParameter param;
-    size_t num_elements = std::count (value.begin (), value.end (), ',') + 1;
-    TypeDesc elem_type = type.elementtype();
+    ImageIOParameter param (name, type, 1, NULL);
+    TypeDesc::BASETYPE basetype = (TypeDesc::BASETYPE)type.basetype;
 
-    if (elem_type == TypeDesc::INT || elem_type == TypeDesc::INT16) {
-        parse_elements<int> (name, type, "%d", value, num_elements, param);
-    } else if (elem_type == TypeDesc::UINT || elem_type == TypeDesc::UINT16) {
-        parse_elements<unsigned int> (name, type, "%d", value, num_elements, param);
-    } else if (elem_type == TypeDesc::FLOAT) {
-        parse_elements<float> (name, type, "%g", value, num_elements, param);
-    } else if (elem_type == TypeDesc::DOUBLE) {
-        parse_elements<double> (name, type, "%g", value, num_elements, param);
-    } else if (elem_type == TypeDesc::INT64) {
-        parse_elements<long long> (name, type, "%lld", value, num_elements, param);
-    } else if (elem_type == TypeDesc::UINT64) {
-        parse_elements<unsigned long long> (name, type, "%llu", value, num_elements, param);
-    } else if (elem_type == TypeDesc::TypeMatrix) {
-        ImageIOParameter tmp_param;
-        num_elements = std::count (value.begin (), value.end (), ' ') + 1;
-        TypeDesc tmp_type = TypeDesc (TypeDesc::FLOAT, 16);
-        parse_elements <float> (name, tmp_type, "%g", value, num_elements, tmp_param);
-        param.init (name, TypeDesc::TypeMatrix, num_elements/16, tmp_param.data());
-    } else if (elem_type == TypeDesc::STRING) {
-        // Remove quotation marks.
-        std::string tmp_value = value.substr (1, value.length () - 2);
-        const char *value_data = tmp_value.data ();
-        param.init (name, TypeDesc::TypeString, 1, &value_data);
+    if (basetype == TypeDesc::INT) {
+        parse_elements<int> (name, type, "%d", value, param);
+    } else if (basetype == TypeDesc::UINT) {
+        parse_elements<unsigned int> (name, type, "%u", value, param);
+    } else if (basetype == TypeDesc::FLOAT) {
+        parse_elements<float> (name, type, "%f", value, param);
+    } else if (basetype == TypeDesc::DOUBLE) {
+        parse_elements<double> (name, type, "%lf", value, param);
+    } else if (basetype == TypeDesc::INT64) {
+        parse_elements<long long> (name, type, "%lld", value, param);
+    } else if (basetype == TypeDesc::UINT64) {
+        parse_elements<unsigned long long> (name, type, "%llu", value, param);
+    } else if (basetype == TypeDesc::INT16) {
+        parse_elements<short> (name, type, "%hd", value, param);
+    } else if (basetype == TypeDesc::UINT16) {
+        parse_elements<unsigned short> (name, type, "%hu", value, param);
+    } else if (type == TypeDesc::STRING) {
+        ustring s (value);
+        param.init (name, TypeDesc::TypeString, 1, &s);
     }
 
     // Don't allow duplicates
@@ -420,105 +352,109 @@ ImageSpec::attribute (const std::string &name, TypeDesc type, const std::string 
     }
 }
 
-namespace
-{
 
-ImageIOParameterList::iterator
-get_attribute_iterator (ImageIOParameterList & attribs,
-                        const std::string &name, TypeDesc searchtype,
-                        bool casesensitive)
-{
-    if (casesensitive) {
-        for(ImageIOParameterList::iterator iter = attribs.begin();
-            iter != attribs.end(); ++iter) {
-            if (iter->name() == name &&
-                (searchtype == TypeDesc::UNKNOWN || searchtype == iter->type()))
-                return iter;
-        }
-    } else {
-        for(ImageIOParameterList::iterator iter = attribs.begin();
-            iter != attribs.end(); ++iter) {
-            if (Strutil::iequals (iter->name().string(), name) &&
-                (searchtype == TypeDesc::UNKNOWN || searchtype == iter->type()))
-                return iter;
-        }
-    }
-    
-    return attribs.end();
-}
-
-ImageIOParameterList::const_iterator
-get_attribute_const_iterator (const ImageIOParameterList & attribs,
-                              const std::string &name, TypeDesc searchtype,
-                              bool casesensitive)
-{
-    if (casesensitive) {
-        for(ImageIOParameterList::const_iterator iter = attribs.begin();
-            iter != attribs.end(); ++iter) {
-            if (iter->name() == name &&
-                (searchtype == TypeDesc::UNKNOWN || searchtype == iter->type()))
-                return iter;
-        }
-    } else {
-        for(ImageIOParameterList::const_iterator iter = attribs.begin();
-            iter != attribs.end(); ++iter) {
-            if (Strutil::iequals (iter->name().string(), name) &&
-                (searchtype == TypeDesc::UNKNOWN || searchtype == iter->type()))
-                return iter;
-        }
-    }
-    
-    return attribs.end();
-}
-
-
-}
 
 void
-ImageSpec::erase_attribute (const std::string &name, TypeDesc searchtype,
+ImageSpec::erase_attribute (string_view name, TypeDesc searchtype,
                             bool casesensitive)
 {
     ImageIOParameterList::iterator iter =
-        get_attribute_iterator (extra_attribs, name, searchtype, casesensitive);
-    if(iter != extra_attribs.end()) {
+        extra_attribs.find (name, searchtype, casesensitive);
+    if (iter != extra_attribs.end())
         extra_attribs.erase (iter);
-    }
 }
 
+
 ImageIOParameter *
-ImageSpec::find_attribute (const std::string &name, TypeDesc searchtype,
+ImageSpec::find_attribute (string_view name, TypeDesc searchtype,
                            bool casesensitive)
 {
     ImageIOParameterList::iterator iter =
-        get_attribute_iterator (extra_attribs, name, searchtype, casesensitive);
-    if(iter != extra_attribs.end ()) {
+        extra_attribs.find (name, searchtype, casesensitive);
+    if (iter != extra_attribs.end())
         return &(*iter);
-    }
-    
     return NULL;
 }
 
 
 
 const ImageIOParameter *
-ImageSpec::find_attribute (const std::string &name, TypeDesc searchtype,
+ImageSpec::find_attribute (string_view name, TypeDesc searchtype,
                            bool casesensitive) const
 {
-    ImageIOParameterList::const_iterator iter = \
-        get_attribute_const_iterator (extra_attribs, name, searchtype, casesensitive);
-    if(iter != extra_attribs.end()) {
+    ImageIOParameterList::const_iterator iter =
+        extra_attribs.find (name, searchtype, casesensitive);
+    if (iter != extra_attribs.end())
         return &(*iter);
+    return NULL;
+}
+
+
+
+const ImageIOParameter *
+ImageSpec::find_attribute (string_view name, ImageIOParameter &tmpparam,
+                           TypeDesc searchtype, bool casesensitive) const
+{
+    ImageIOParameterList::const_iterator iter =
+        extra_attribs.find (name, searchtype, casesensitive);
+    if (iter != extra_attribs.end())
+        return &(*iter);
+    // Check named items in the ImageSpec structs, not in extra_attrubs
+#define MATCH(n,t) (((!casesensitive && Strutil::iequals(name,n)) || \
+                     ( casesensitive && name == n)) && \
+                    (searchtype == TypeDesc::UNKNOWN || searchtype == t))
+#define GETINT(n) if (MATCH(#n,TypeDesc::TypeInt)) { \
+                      tmpparam.init (#n, TypeDesc::TypeInt, 1, &this->n); \
+                      return &tmpparam; \
+                  }
+    GETINT(nchannels);
+    GETINT(width);
+    GETINT(height);
+    GETINT(depth);
+    GETINT(x);
+    GETINT(y);
+    GETINT(z);
+    GETINT(full_width);
+    GETINT(full_height);
+    GETINT(full_depth);
+    GETINT(full_x);
+    GETINT(full_y);
+    GETINT(full_z);
+    GETINT(tile_width);
+    GETINT(tile_height);
+    GETINT(tile_depth);
+    GETINT(alpha_channel);
+    GETINT(z_channel);
+    // some special cases
+    if (MATCH("geom", TypeDesc::TypeString)) {
+        ustring s = (depth <= 1 && full_depth <= 1)
+                    ? ustring::format ("%dx%d%+d%+d", width, height, x, y)
+                    : ustring::format ("%dx%dx%d%+d%+d%+d", width, height, depth, x, y, z);
+        tmpparam.init ("geom", TypeDesc::TypeString, 1, &s);
+        return &tmpparam;
     }
-    
+    if (MATCH("full_geom", TypeDesc::TypeString)) {
+        ustring s = (depth <= 1 && full_depth <= 1)
+                    ? ustring::format ("%dx%d%+d%+d",
+                                       full_width, full_height, full_x, full_y)
+                    : ustring::format ("%dx%dx%d%+d%+d%+d",
+                                       full_width, full_height, full_depth,
+                                       full_x, full_y, full_z);
+        tmpparam.init ("full_geom", TypeDesc::TypeString, 1, &s);
+        return &tmpparam;
+    }
+#undef GETINT
+#undef MATCH
     return NULL;
 }
 
 
 
 int
-ImageSpec::get_int_attribute (const std::string &name, int val) const
+ImageSpec::get_int_attribute (string_view name, int val) const
 {
-    const ImageIOParameter *p = find_attribute (name);
+    ImageIOParameter tmpparam;
+    const ImageIOParameter *p = find_attribute (name, tmpparam);
     if (p) {
         if (p->type() == TypeDesc::INT)
             val = *(const int *)p->data();
@@ -543,9 +479,10 @@ ImageSpec::get_int_attribute (const std::string &name, int val) const
 
 
 float
-ImageSpec::get_float_attribute (const std::string &name, float val) const
+ImageSpec::get_float_attribute (string_view name, float val) const
 {
-    const ImageIOParameter *p = find_attribute (name);
+    ImageIOParameter tmpparam;
+    const ImageIOParameter *p = find_attribute (name, tmpparam);
     if (p) {
         if (p->type() == TypeDesc::FLOAT)
             val = *(const float *)p->data();
@@ -553,19 +490,35 @@ ImageSpec::get_float_attribute (const std::string &name, float val) const
             val = *(const half *)p->data();
         else if (p->type() == TypeDesc::DOUBLE)
             val = (float) *(const double *)p->data();
+        else if (p->type() == TypeDesc::INT)
+            val = (float) *(const int *)p->data();
+        else if (p->type() == TypeDesc::UINT)
+            val = (float) *(const unsigned int *)p->data();
+        else if (p->type() == TypeDesc::INT16)
+            val = (float) *(const short *)p->data();
+        else if (p->type() == TypeDesc::UINT16)
+            val = (float) *(const unsigned short *)p->data();
+        else if (p->type() == TypeDesc::INT8)
+            val = (float) *(const char *)p->data();
+        else if (p->type() == TypeDesc::UINT8)
+            val = (float) *(const unsigned char *)p->data();
+        else if (p->type() == TypeDesc::INT64)
+            val = (float) *(const long long *)p->data();
+        else if (p->type() == TypeDesc::UINT64)
+            val = (float) *(const unsigned long long *)p->data();
     }
     return val;
 }
 
 
 
-std::string
-ImageSpec::get_string_attribute (const std::string &name,
-                                 const std::string &val) const
+string_view
+ImageSpec::get_string_attribute (string_view name, string_view val) const
 {
-    const ImageIOParameter *p = find_attribute (name, TypeDesc::STRING);
+    ImageIOParameter tmpparam;
+    const ImageIOParameter *p = find_attribute (name, tmpparam, TypeDesc::STRING);
     if (p)
-        return std::string (*(const char **)p->data());
+        return *(ustring *)p->data();
     else return val;
 }
 
@@ -573,69 +526,61 @@ ImageSpec::get_string_attribute (const std::string &name,
 
 namespace {  // make an anon namespace
 
+template < typename T >
+void formatType(const ImageIOParameter& p, const int n, const TypeDesc& element, const char* formatString, std::string& out) {
+  const T *f = (const T *)p.data();
+  for (int i = 0;  i < n;  ++i) {
+      if (i)
+          out += ", ";
+      for (int c = 0;  c < (int)element.aggregate;  ++c, ++f)
+          out += Strutil::format (formatString, (c ? " " : ""), f[0]);
+  }
+}
 
 static std::string
-format_raw_metadata (const ImageIOParameter &p)
+format_raw_metadata (const ImageIOParameter &p, int maxsize=16)
 {
     std::string out;
     TypeDesc element = p.type().elementtype();
-    int n = p.type().numelements() * p.nvalues();
-    if (element == TypeDesc::STRING) {
+    int nfull = int(p.type().numelements()) * p.nvalues();
+    int n = std::min (nfull, maxsize);
+    if (element.basetype == TypeDesc::STRING) {
         for (int i = 0;  i < n;  ++i) {
             const char *s = ((const char **)p.data())[i];
-            out += Strutil::format ("%s\"%s\"", (i ? ", " : ""), s ? s : "");
+            out += Strutil::format ("%s\"%s\"", (i ? ", " : ""),
+                                    s ? Strutil::escape_chars(s) : std::string());
         }
     } else if (element.basetype == TypeDesc::FLOAT) {
-        const float *f = (const float *)p.data();
-        for (int i = 0;  i < n;  ++i) {
-            if (i)
-                out += ", ";
-            for (int c = 0;  c < (int)element.aggregate;  ++c, ++f)
-                out += Strutil::format ("%s%g", (c ? " " : ""), f[0]);
-        }
+        formatType< float >(p, n, element, "%s%g", out);
     } else if (element.basetype == TypeDesc::DOUBLE) {
-        const double *f = (const double *)p.data();
-        for (int i = 0;  i < n;  ++i) {
-            if (i)
-                out += ", ";
-            for (int c = 0;  c < (int)element.aggregate;  ++c, ++f)
-                out += Strutil::format ("%s%g", (c ? " " : ""), f[0]);
-        }
+        formatType< double >(p, n, element, "%s%g", out);
     } else if (element.basetype == TypeDesc::HALF) {
-        const half *f = (const half *)p.data();
-        for (int i = 0;  i < n;  ++i) {
-            if (i)
-                out += ", ";
-            for (int c = 0;  c < (int)element.aggregate;  ++c, ++f)
-                out += Strutil::format ("%s%g", (c ? " " : ""), (float)f[0]);
-        }
-    } else if (element == TypeDesc::INT) {
-        for (int i = 0;  i < n;  ++i)
-            out += Strutil::format ("%s%d", (i ? ", " : ""), ((const int *)p.data())[i]);
-    } else if (element == TypeDesc::UINT) {
-        for (int i = 0;  i < n;  ++i)
-            out += Strutil::format ("%s%d", (i ? ", " : ""), ((const unsigned int *)p.data())[i]);
-    } else if (element == TypeDesc::UINT16) {
-        for (int i = 0;  i < n;  ++i)
-            out += Strutil::format ("%s%u", (i ? ", " : ""), ((const unsigned short *)p.data())[i]);
-    } else if (element == TypeDesc::INT16) {
-        for (int i = 0;  i < n;  ++i)
-            out += Strutil::format ("%s%d", (i ? ", " : ""), ((const short *)p.data())[i]);
-    } else if (element == TypeDesc::UINT64) {
-        for (int i = 0;  i < n;  ++i)
-            out += Strutil::format ("%s%llu", (i ? ", " : ""), ((const unsigned long long *)p.data())[i]);
-    } else if (element == TypeDesc::INT64) {
-        for (int i = 0;  i < n;  ++i)
-            out += Strutil::format ("%s%lld", (i ? ", " : ""), ((const long long *)p.data())[i]);
+        formatType< half >(p, n, element, "%s%g", out);
+    } else if (element.basetype == TypeDesc::INT) {
+        formatType< int >(p, n, element, "%s%d", out);
+    } else if (element.basetype == TypeDesc::UINT) {
+        formatType< unsigned int >(p, n, element, "%s%d", out);
+    } else if (element.basetype == TypeDesc::UINT16) {
+        formatType< unsigned short >(p, n, element, "%s%u", out);
+    } else if (element.basetype == TypeDesc::INT16) {
+        formatType< short >(p, n, element, "%s%d", out);
+    } else if (element.basetype == TypeDesc::UINT64) {
+        formatType< unsigned long long >(p, n, element, "%s%llu", out);
+    } else if (element.basetype == TypeDesc::INT64) {
+        formatType< long long >(p, n, element, "%s%lld", out);
+    } else if (element.basetype == TypeDesc::UINT8) {
+        formatType< unsigned char >(p, n, element, "%s%d", out);
+    } else if (element.basetype == TypeDesc::INT8) {
+        formatType< char >(p, n, element, "%s%d", out);
     } else {
         out += Strutil::format ("<unknown data type> (base %d, agg %d vec %d)",
                 p.type().basetype, p.type().aggregate,
                 p.type().vecsemantics);
     }
+    if (n < nfull)
+        out += ", ...";
     return out;
 }
-
-
 
 struct LabelTable {
     int value;
@@ -690,9 +635,13 @@ explain_apertureapex (const ImageIOParameter &p, const void *extradata)
 static std::string
 explain_ExifFlash (const ImageIOParameter &p, const void *extradata)
 {
-    if (p.type() == TypeDesc::UINT) {
-        unsigned int val = *(unsigned int *)p.data();
-        return Strutil::format ("%s%s%s%s%s%s%s%s",
+    int val = 0;
+    if (p.type() == TypeDesc::INT)
+        val = *(int *)p.data();
+    else if (p.type() == TypeDesc::UINT)
+        val = *(unsigned int *)p.data();
+    else return std::string();
+    return Strutil::format ("%s%s%s%s%s%s%s%s",
                                 (val&1) ? "flash fired" : "no flash",
                                 (val&6) == 4 ? ", no strobe return" : "",
                                 (val&6) == 6 ? ", strobe return" : "",
@@ -701,8 +650,6 @@ explain_ExifFlash (const ImageIOParameter &p, const void *extradata)
                                 (val&24) == 24 ? ", auto flash" : "",
                                 (val&32) ? ", no flash available" : "",
                                 (val&64) ? ", red-eye reduction" : "");
-    }
-    return std::string();
 }
 
 static LabelTable ExifExposureProgram_table[] = {
@@ -712,6 +659,7 @@ static LabelTable ExifExposureProgram_table[] = {
     { 6, "Action program, biased toward fast shutter" },
     { 7, "Portrait mode, foreground in focus" },
     { 8, "Landscape mode, background in focus" },
+    { 9, "bulb" },
     { -1, NULL }
 };
 
@@ -757,7 +705,8 @@ static LabelTable orientation_table[] = {
 };
 
 static LabelTable resunit_table[] = {
-    { 1, "none" }, { 2, "inches" }, { 3, "cm" }, { -1, NULL }
+    { 1, "none" }, { 2, "inches" }, { 3, "cm" },
+    { 4, "mm" }, { 5, "um" }, { -1, NULL }
 };
 
 static LabelTable ExifSensingMethod_table[] = {
@@ -768,6 +717,7 @@ static LabelTable ExifSensingMethod_table[] = {
 };
 
 static LabelTable ExifFileSource_table[] = {
+    { 1, "film scanner" }, { 2, "reflection print scanner" },
     { 3, "digital camera" }, { -1, NULL }
 };
 
@@ -806,7 +756,7 @@ static LabelTable GPSAltitudeRef_table[] = {
 };
 
 static LabelTable GPSStatus_table[] = {
-    { 'A', "measurement in progress" }, { 'V', "measurement interoperability" },
+    { 'A', "measurement active" }, { 'V', "measurement void" },
     { -1, NULL }
 };
 
@@ -820,12 +770,12 @@ static LabelTable GPSSpeedRef_table[] = {
 };
 
 static LabelTable GPSDestDistanceRef_table[] = {
-    { 'K', "km" }, { 'M', "miles" }, { 'N', "knots" }, 
+    { 'K', "km" }, { 'M', "miles" }, { 'N', "nautical miles" },
     { -1, NULL }
 };
 
 static LabelTable magnetic_table[] = {
-    { 'T', "true direction" }, { 'M', "magnetic direction" }, { -1, NULL }
+    { 'T', "true north" }, { 'M', "magnetic north" }, { -1, NULL }
 };
 
 typedef std::string (*ExplainerFunc) (const ImageIOParameter &p, 
@@ -876,14 +826,14 @@ static ExplanationTableEntry explanation[] = {
     { NULL, NULL, NULL }
 }; 
 
-}; // end anon namespace
+} // end anon namespace
 
 
 
 std::string
-ImageSpec::metadata_val (const ImageIOParameter &p, bool human) const
+ImageSpec::metadata_val (const ImageIOParameter &p, bool human)
 {
-    std::string out = format_raw_metadata (p);
+    std::string out = format_raw_metadata (p, human ? 16 : 1024);
 
     if (human) {
         std::string nice;
@@ -893,6 +843,11 @@ ImageSpec::metadata_val (const ImageIOParameter &p, bool human) const
                 nice = explanation[e].explainer (p, explanation[e].extradata);
                 break;
             }
+        }
+        if (p.type() == TypeDesc::TypeTimeCode) {
+            Imf::TimeCode tc = *reinterpret_cast<const Imf::TimeCode *>(p.data());
+            nice = Strutil::format ("%02d:%02d:%02d:%02d", tc.hours(),
+                                    tc.minutes(), tc.seconds(), tc.frame());
         }
         if (nice.length())
             out = out + " (" + nice + ")";
@@ -907,22 +862,23 @@ namespace { // Helper functions for from_xml () and to_xml () methods.
 
 using namespace pugi;
 
-static void
-add_node (xml_node &node, const std::string &node_name, const char *val)
+static xml_node
+add_node (xml_node &node, string_view node_name, const char *val)
 {
     xml_node newnode = node.append_child();
     newnode.set_name (node_name.c_str ());
     newnode.append_child (node_pcdata).set_value (val);
+    return newnode;
 }
 
 
 
-static void
-add_node (xml_node &node, const std::string &node_name, const int val)
+static xml_node
+add_node (xml_node &node, string_view node_name, const int val)
 {
     char buf[64];
     sprintf (buf, "%d", val);
-    add_node (node, node_name, buf);
+    return add_node (node, node_name, buf);
 }
 
 
@@ -932,9 +888,8 @@ add_channelnames_node (xml_document &doc, const std::vector<std::string> &channe
 {
     xml_node channel_node = doc.child ("ImageSpec").append_child();
     channel_node.set_name ("channelnames");
-    BOOST_FOREACH (std::string name, channelnames) {
+    for (auto&& name : channelnames)
         add_node (channel_node, "channelname", name.c_str ());
-    }
 }
 
 
@@ -954,8 +909,43 @@ get_channelnames (const xml_node &n, std::vector<std::string> &channelnames)
 
 
 
-std::string
-ImageSpec::to_xml () const
+static const char *
+extended_format_name (TypeDesc type, int bits)
+{
+    if (bits && bits < (int)type.size()*8) {
+        // The "oiio:BitsPerSample" betrays a different bit depth in the
+        // file than the data type we are passing.
+        if (type == TypeDesc::UINT8 || type == TypeDesc::UINT16 ||
+            type == TypeDesc::UINT32 || type == TypeDesc::UINT64)
+            return ustring::format("uint%d", bits).c_str();
+        if (type == TypeDesc::INT8 || type == TypeDesc::INT16 ||
+            type == TypeDesc::INT32 || type == TypeDesc::INT64)
+            return ustring::format("int%d", bits).c_str();
+    }
+    return type.c_str();  // use the name implied by type
+}
+
+
+
+inline std::string
+format_res (const ImageSpec &spec, int w, int h, int d)
+{
+    using Strutil::format;
+    return (spec.depth > 1) ? format("%d x %d x %d", w, h, d) : format("%d x %d", w, h);
+}
+
+
+inline std::string
+format_offset (const ImageSpec &spec, int x, int y, int z)
+{
+    using Strutil::format;
+    return (spec.depth > 1) ? format("%d, %d, %d", x, y, z) : format("%d, %d", x, y);
+}
+
+
+
+static std::string
+spec_to_xml (const ImageSpec &spec, ImageSpec::SerialVerbose verbose)
 {
     xml_document doc;
 
@@ -963,33 +953,141 @@ ImageSpec::to_xml () const
     doc.child ("ImageSpec").append_attribute ("version") = OIIO_PLUGIN_VERSION;
     xml_node node = doc.child ("ImageSpec");
 
-    add_node (node, "x", x);
-    add_node (node, "y", y);
-    add_node (node, "z", z);
-    add_node (node, "width", width);
-    add_node (node, "height", height);
-    add_node (node, "depth", depth);
-    add_node (node, "full_x", full_x);
-    add_node (node, "full_y", full_y);
-    add_node (node, "full_z", full_z);
-    add_node (node, "full_width", full_width);
-    add_node (node, "full_height", full_height);
-    add_node (node, "full_depth", full_depth);
-    add_node (node, "tile_width", tile_width);
-    add_node (node, "tile_height", tile_height);
-    add_node (node, "tile_depth", tile_depth);
-    add_node (node, "format", format.c_str ());
-    add_node (node, "nchannels", nchannels);
-    add_channelnames_node (doc, channelnames);
-    add_node (node, "alpha_channel", alpha_channel);
-    add_node (node, "z_channel", z_channel);
-    add_node (node, "deep", int(deep));
-    
-    // FIXME: What about extra attributes?
-    
+    add_node (node, "x", spec.x);
+    add_node (node, "y", spec.y);
+    add_node (node, "z", spec.z);
+    add_node (node, "width", spec.width);
+    add_node (node, "height", spec.height);
+    add_node (node, "depth", spec.depth);
+    add_node (node, "full_x", spec.full_x);
+    add_node (node, "full_y", spec.full_y);
+    add_node (node, "full_z", spec.full_z);
+    add_node (node, "full_width", spec.full_width);
+    add_node (node, "full_height", spec.full_height);
+    add_node (node, "full_depth", spec.full_depth);
+    add_node (node, "tile_width", spec.tile_width);
+    add_node (node, "tile_height", spec.tile_height);
+    add_node (node, "tile_depth", spec.tile_depth);
+    add_node (node, "format", spec.format.c_str ());
+    add_node (node, "nchannels", spec.nchannels);
+    add_channelnames_node (doc, spec.channelnames);
+    add_node (node, "alpha_channel", spec.alpha_channel);
+    add_node (node, "z_channel", spec.z_channel);
+    add_node (node, "deep", int(spec.deep));
+
+    if (verbose > ImageSpec::SerialBrief) {
+        for (auto&& p : spec.extra_attribs) {
+            std::string s = spec.metadata_val (p, false);  // raw data
+            if (s == "1.#INF")
+                s ="inf";
+            if (p.type() == TypeDesc::STRING) {
+                if (s.size() >= 2 && s[0] == '\"' && s[s.size()-1] == '\"')
+                    s = s.substr (1, s.size()-2);
+            }
+            std::string desc;
+            for (int e = 0;  explanation[e].oiioname;  ++e) {
+                if (! strcmp (explanation[e].oiioname, p.name().c_str()) &&
+                    explanation[e].explainer) {
+                    desc = explanation[e].explainer (p, explanation[e].extradata);
+                    break;
+                }
+            }
+            if (p.type() == TypeDesc::TypeTimeCode) {
+                Imf::TimeCode tc = *reinterpret_cast<const Imf::TimeCode *>(p.data());
+                desc = Strutil::format ("%02d:%02d:%02d:%02d", tc.hours(),
+                                        tc.minutes(), tc.seconds(), tc.frame());
+            }
+            xml_node n = add_node (node, "attrib", s.c_str());
+            n.append_attribute("name").set_value (p.name().c_str());
+            n.append_attribute("type").set_value (p.type().c_str());
+            if (! desc.empty())
+                n.append_attribute("description").set_value (desc.c_str());
+        }
+    }
+
     std::ostringstream result;
     doc.print (result, "");
     return result.str();
+}
+
+
+
+
+std::string
+ImageSpec::serialize (SerialFormat fmt, SerialVerbose verbose) const
+{
+    if (fmt == SerialXML)
+        return spec_to_xml (*this, verbose);
+
+    // Text case:
+    //
+
+    using Strutil::format;
+    std::stringstream out;
+
+    out << ((depth > 1) ? format("%4d x %4d x %4d", width, height, depth)
+                        : format("%4d x %4d", width, height));
+    out << format (", %d channel, %s%s", nchannels,
+                   deep ? "deep " : "", depth > 1 ? "volume " : "");
+    if (channelformats.size()) {
+        for (size_t c = 0;  c < channelformats.size();  ++c)
+            out << format ("%s%s", c ? "/" : "", channelformats[c]);
+    } else {
+        int bits = get_int_attribute ("oiio:BitsPerSample", 0);
+        out << extended_format_name (this->format, bits);
+    }
+    out << '\n';
+
+    if (verbose >= SerialDetailed) {
+        out << "    channel list: ";
+        for (int i = 0;  i < nchannels;  ++i) {
+            if (i < (int)channelnames.size())
+                out << channelnames[i];
+            else
+                out << "unknown";
+            if (i < (int)channelformats.size())
+                out << format (" (%s)", channelformats[i]);
+            if (i < nchannels-1)
+                out << ", ";
+        }
+        out << '\n';
+        if (x || y || z) {
+            out << "    pixel data origin: "
+                << ((depth > 1) ? format("x=%d, y=%d, z=%d", x, y, z)
+                                : format("x=%d, y=%d", x, y)) << '\n';
+        }
+        if (full_x || full_y || full_z ||
+              (full_width != width && full_width != 0) ||
+              (full_height != height && full_height != 0) ||
+              (full_depth != depth && full_depth != 0)) {
+            out << "    full/display size: "
+                << format_res (*this, full_width, full_height, full_depth) << '\n';
+            out << "    full/display origin: "
+                << format_offset (*this, full_x, full_y, full_z) << '\n';
+        }
+        if (tile_width) {
+            out << "    tile size: "
+                << format_res (*this, tile_width, tile_height, tile_depth) << '\n';
+        }
+
+        for (auto&& p : extra_attribs) {
+            out << format ("    %s: ", p.name());
+            std::string s = metadata_val (p, verbose == SerialDetailedHuman);
+            if (s == "1.#INF")
+                s ="inf";
+            out << s << '\n';
+        }
+    }
+
+    return out.str();
+}
+
+
+
+std::string
+ImageSpec::to_xml () const
+{
+    return spec_to_xml (*this, SerialDetailedHuman);
 }
 
 
@@ -1032,6 +1130,4 @@ ImageSpec::from_xml (const char *xml)
 }
 
 
-}
-OIIO_NAMESPACE_EXIT
-
+OIIO_NAMESPACE_END

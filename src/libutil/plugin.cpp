@@ -31,19 +31,17 @@
 #include <cstdlib>
 #include <string>
 
-#ifdef _WIN32
-# include "osdep.h"
-#else
+#include "OpenImageIO/platform.h"
+
+#ifndef _WIN32
 # include <dlfcn.h>
 #endif
 
-#include "thread.h"
+#include "OpenImageIO/thread.h"
+#include "OpenImageIO/plugin.h"
 
-#include "plugin.h"
 
-
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 using namespace Plugin;
 
@@ -165,5 +163,4 @@ Plugin::geterror (void)
     return e;
 }
 
-}
-OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END

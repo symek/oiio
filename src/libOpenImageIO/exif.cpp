@@ -37,13 +37,19 @@
 #include <set>
 #include <algorithm>
 
-#include <boost/foreach.hpp>
-
-#include "fmath.h"
+#include "OpenImageIO/fmath.h"
 
 extern "C" {
 #include "tiff.h"
 }
+
+// Some EXIF tags that don't seem to be in tiff.h
+#ifndef EXIFTAG_SECURITYCLASSIFICATION
+#define EXIFTAG_SECURITYCLASSIFICATION 37394
+#endif
+#ifndef EXIFTAG_IMAGEHISTORY
+#define EXIFTAG_IMAGEHISTORY 37395
+#endif
 
 #ifdef TIFF_VERSION_BIG
 // In old versions of TIFF, this was defined in tiff.h.  It's gone from
@@ -63,14 +69,13 @@ struct TIFFDirEntry {
 };
 #endif
 
-#include "imageio.h"
+#include "OpenImageIO/imageio.h"
 
 
-#define DEBUG_EXIF_READ  0
-#define DEBUG_EXIF_WRITE 0
+#define DEBUG_EXIF_READ  1
+#define DEBUG_EXIF_WRITE 1
 
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 namespace {
 
@@ -126,14 +131,14 @@ static const EXIF_tag_info exif_tag_table[] = {
     { EXIFTAG_EXPOSURETIME,	"ExposureTime",	TIFF_RATIONAL, 1 },
     { EXIFTAG_FNUMBER,	        "FNumber",	TIFF_RATIONAL, 1 },
     { EXIFTAG_EXPOSUREPROGRAM,	"Exif:ExposureProgram",	TIFF_SHORT, 1 }, // ?? translate to ascii names?
-    { EXIFTAG_SPECTRALSENSITIVITY,	"Exif:SpectralSensitivity",	TIFF_ASCII, 0 },
+    { EXIFTAG_SPECTRALSENSITIVITY,"Exif:SpectralSensitivity",	TIFF_ASCII, 0 },
     { EXIFTAG_ISOSPEEDRATINGS,	"Exif:ISOSpeedRatings",	TIFF_SHORT, 1 },
     { EXIFTAG_OECF,	        "Exif:OECF",	TIFF_NOTYPE, 1 },	 // skip it
     { EXIFTAG_EXIFVERSION,	"Exif:ExifVersion",	TIFF_NOTYPE, 1 },	 // skip it
     { EXIFTAG_DATETIMEORIGINAL,	"Exif:DateTimeOriginal",	TIFF_ASCII, 0 },
     { EXIFTAG_DATETIMEDIGITIZED,"Exif:DateTimeDigitized",	TIFF_ASCII, 0 },
-    { EXIFTAG_COMPONENTSCONFIGURATION,	"Exif:ComponentsConfiguration",	TIFF_UNDEFINED, 1 },
-    { EXIFTAG_COMPRESSEDBITSPERPIXEL,	"Exif:CompressedBitsPerPixel",	TIFF_RATIONAL, 1 },
+    { EXIFTAG_COMPONENTSCONFIGURATION, "Exif:ComponentsConfiguration",	TIFF_UNDEFINED, 1 },
+    { EXIFTAG_COMPRESSEDBITSPERPIXEL,  "Exif:CompressedBitsPerPixel",	TIFF_RATIONAL, 1 },
     { EXIFTAG_SHUTTERSPEEDVALUE,"Exif:ShutterSpeedValue",	TIFF_SRATIONAL, 1 }, // APEX units
     { EXIFTAG_APERTUREVALUE,	"Exif:ApertureValue",	TIFF_RATIONAL, 1 },	// APEX units
     { EXIFTAG_BRIGHTNESSVALUE,	"Exif:BrightnessValue",	TIFF_SRATIONAL, 1 },
@@ -144,6 +149,8 @@ static const EXIF_tag_info exif_tag_table[] = {
     { EXIFTAG_LIGHTSOURCE,	"Exif:LightSource",	TIFF_SHORT, 1 },
     { EXIFTAG_FLASH,	        "Exif:Flash",	        TIFF_SHORT, 1 },
     { EXIFTAG_FOCALLENGTH,	"Exif:FocalLength",	TIFF_RATIONAL, 1 }, // mm
+    { EXIFTAG_SECURITYCLASSIFICATION, "Exif:SecurityClassification", TIFF_ASCII, 1 },
+    { EXIFTAG_IMAGEHISTORY,     "Exif:ImageHistory",    TIFF_ASCII, 1 },
     { EXIFTAG_SUBJECTAREA,	"Exif:SubjectArea",	TIFF_NOTYPE, 1 }, // skip
     { EXIFTAG_MAKERNOTE,	"Exif:MakerNote",	TIFF_NOTYPE, 1 },	 // skip it
     { EXIFTAG_USERCOMMENT,	"Exif:UserComment",	TIFF_NOTYPE, 1 },	// skip it
@@ -154,7 +161,7 @@ static const EXIF_tag_info exif_tag_table[] = {
     { EXIFTAG_COLORSPACE,	"Exif:ColorSpace",	TIFF_SHORT, 1 },
     { EXIFTAG_PIXELXDIMENSION,	"Exif:PixelXDimension",	TIFF_LONG, 1 },
     { EXIFTAG_PIXELYDIMENSION,	"Exif:PixelYDimension",	TIFF_LONG, 1 },
-    { EXIFTAG_RELATEDSOUNDFILE,	"Exif:RelatedSoundFile", TIFF_NOTYPE, 1 },	// skip
+    { EXIFTAG_RELATEDSOUNDFILE,	"Exif:RelatedSoundFile", TIFF_ASCII, 0 },
     { EXIFTAG_FLASHENERGY,	"Exif:FlashEnergy",	TIFF_RATIONAL, 1 },
     { EXIFTAG_SPATIALFREQUENCYRESPONSE,	"Exif:SpatialFrequencyResponse",	TIFF_NOTYPE, 1 },
     { EXIFTAG_FOCALPLANEXRESOLUTION,	"Exif:FocalPlaneXResolution",	TIFF_RATIONAL, 1 },
@@ -170,7 +177,7 @@ static const EXIF_tag_info exif_tag_table[] = {
     { EXIFTAG_EXPOSUREMODE,	"Exif:ExposureMode",	TIFF_SHORT, 1 },
     { EXIFTAG_WHITEBALANCE,	"Exif:WhiteBalance",	TIFF_SHORT, 1 },
     { EXIFTAG_DIGITALZOOMRATIO,	"Exif:DigitalZoomRatio",TIFF_RATIONAL, 1 },
-    { EXIFTAG_FOCALLENGTHIN35MMFILM,	"Exif:FocalLengthIn35mmFilm",	TIFF_SHORT, 1 },
+    { EXIFTAG_FOCALLENGTHIN35MMFILM, "Exif:FocalLengthIn35mmFilm",	TIFF_SHORT, 1 },
     { EXIFTAG_SCENECAPTURETYPE,	"Exif:SceneCaptureType",TIFF_SHORT, 1 },
     { EXIFTAG_GAINCONTROL,	"Exif:GainControl",	TIFF_RATIONAL, 1 },
     { EXIFTAG_CONTRAST,	        "Exif:Contrast",	TIFF_SHORT, 1 },
@@ -178,7 +185,21 @@ static const EXIF_tag_info exif_tag_table[] = {
     { EXIFTAG_SHARPNESS,	"Exif:Sharpness",	TIFF_SHORT, 1 },
     { EXIFTAG_DEVICESETTINGDESCRIPTION,	"Exif:DeviceSettingDescription",	TIFF_NOTYPE, 1 },
     { EXIFTAG_SUBJECTDISTANCERANGE,	"Exif:SubjectDistanceRange",	TIFF_SHORT, 1 },
-    { EXIFTAG_IMAGEUNIQUEID,	"Exif:ImageUniqueID",	TIFF_ASCII, 0 },
+    { EXIFTAG_IMAGEUNIQUEID,	"Exif:ImageUniqueID",   TIFF_ASCII, 0 },
+    { 34855,                    "Exif:PhotographicSensitivity",  TIFF_SHORT, 1 },
+    { 34864,                    "Exif:SensitivityType",  TIFF_SHORT, 1 },
+    { 34865,                    "Exif:StandardOutputSensitivity", TIFF_LONG, 1 },
+    { 34866,                    "Exif:RecommendedExposureIndex", TIFF_LONG, 1 },
+    { 34867,                    "Exif:ISOSpeed", TIFF_LONG, 1 },
+    { 34868,                    "Exif:ISOSpeedLatitudeyyy", TIFF_LONG, 1 },
+    { 34869,                    "Exif:ISOSpeedLatitudezzz", TIFF_LONG, 1 },
+    { 42032,                    "Exif:CameraOwnerName",  TIFF_ASCII, 0 },
+    { 42033,                    "Exif:BodySerialNumber", TIFF_ASCII, 0 },
+    { 42034,                    "Exif:LensSpecification",TIFF_RATIONAL, 4 },
+    { 42035,                    "Exif:LensMake",         TIFF_ASCII, 0 },
+    { 42036,                    "Exif:LensModel",        TIFF_ASCII, 0 },
+    { 42037,                    "Exif:LensSerialNumber", TIFF_ASCII, 0 },
+    { 42240,                    "Exif:Gamma", TIFF_RATIONAL, 0 },
     { -1, NULL }  // signal end of table
 };
 
@@ -205,7 +226,8 @@ enum GPSTag {
     GPSTAG_PROCESSINGMETHOD = 27,
     GPSTAG_AREAINFORMATION = 28,
     GPSTAG_DATESTAMP = 29,
-    GPSTAG_DIFFERENTIAL = 30
+    GPSTAG_DIFFERENTIAL = 30,
+    GPSTAG_HPOSITIONINGERROR = 31
 };
 
 static const EXIF_tag_info gps_tag_table[] = {
@@ -240,6 +262,7 @@ static const EXIF_tag_info gps_tag_table[] = {
     { GPSTAG_AREAINFORMATION,	"GPS:AreaInformation",	TIFF_UNDEFINED, 1 },
     { GPSTAG_DATESTAMP,		"GPS:DateStamp",	TIFF_ASCII, 0 },
     { GPSTAG_DIFFERENTIAL,	"GPS:Differential",	TIFF_SHORT, 1 },
+    { GPSTAG_HPOSITIONINGERROR,	"GPS:HPositioningError",TIFF_RATIONAL, 1 },
     { -1, NULL }  // signal end of table
 };
 
@@ -249,20 +272,25 @@ static const EXIF_tag_info gps_tag_table[] = {
 
 class TagMap {
     typedef std::map<int, const EXIF_tag_info *> tagmap_t;
-    typedef std::map<std::string, const EXIF_tag_info *> namemap_t;
+    typedef std::map<string_view, const EXIF_tag_info *> namemap_t;
 public:
     TagMap (const EXIF_tag_info *tag_table) {
         for (int i = 0;  tag_table[i].tifftag >= 0;  ++i) {
             const EXIF_tag_info *eti = &tag_table[i];
             m_tagmap[eti->tifftag] = eti;
             if (eti->name)
-                m_namemap[eti->name] = eti;
+                 m_namemap[string_view(eti->name)] = eti;
         }
     }
 
     const EXIF_tag_info * find (int tag) const {
         tagmap_t::const_iterator i = m_tagmap.find (tag);
         return i == m_tagmap.end() ? NULL : i->second;
+    }
+
+    const EXIF_tag_info * find (string_view name) const {
+        namemap_t::const_iterator i = m_namemap.find (name);
+        return i == m_namemap.end() ? NULL : i->second;
     }
 
     const char * name (int tag) const {
@@ -280,7 +308,7 @@ public:
         return i == m_tagmap.end() ? 0 : i->second->tiffcount;
     }
 
-    int tag (const std::string &name) const {
+    int tag (string_view name) const {
         namemap_t::const_iterator i = m_namemap.find (name);
         return i == m_namemap.end() ? -1 : i->second->tifftag;
     }
@@ -290,20 +318,34 @@ private:
     namemap_t m_namemap;
 };
 
-static TagMap exif_tagmap (exif_tag_table);
-static TagMap gps_tagmap (gps_tag_table);
+static TagMap& exif_tagmap_ref () {
+    static TagMap T (exif_tag_table);
+    return T;
+}
+
+static TagMap& gps_tagmap_ref () {
+    static TagMap T (gps_tag_table);
+    return T;
+}
 
 
 
 
 #if (DEBUG_EXIF_WRITE || DEBUG_EXIF_READ)
-static void
-print_dir_entry (const TagMap &tagmap, 
-                 const TIFFDirEntry &dir, const char *datastart)
+static bool
+print_dir_entry (const TagMap &tagmap,
+                 const TIFFDirEntry &dir, string_view buf)
 {
     int len = tiff_data_size (dir);
-    const char *mydata = (len <= 4) ? (const char *)&dir.tdir_offset 
-                                    : (datastart + dir.tdir_offset);
+    const char *mydata = NULL;
+    if (len <= 4) {  // short data is stored in the offset field
+        mydata = (const char *)&dir.tdir_offset;
+    } else {
+        if (dir.tdir_offset >= buf.size() ||
+           (dir.tdir_offset+tiff_data_size(dir)) >= buf.size())
+            return false;    // bogus! overruns the buffer
+        mydata = buf.data() + dir.tdir_offset;
+    }
     const char *name = tagmap.name(dir.tdir_tag);
     std::cerr << "tag=" << dir.tdir_tag
               << " (" << (name ? name : "unknown") << ")"
@@ -345,6 +387,7 @@ print_dir_entry (const TagMap &tagmap,
         break;
     }
     std::cerr << "\n";
+    return true;
 }
 #endif
 
@@ -359,7 +402,7 @@ print_dir_entry (const TagMap &tagmap,
 /// if necessary, so no byte swapping on *dirp is necessary.
 static void
 add_exif_item_to_spec (ImageSpec &spec, const char *name,
-                       const TIFFDirEntry *dirp, const char *buf, bool swab)
+                       const TIFFDirEntry *dirp, string_view buf, bool swab)
 {
     if (dirp->tdir_type == TIFF_SHORT && dirp->tdir_count == 1) {
         union { uint32_t i32; uint16_t i16[2]; } convert;
@@ -397,7 +440,7 @@ add_exif_item_to_spec (ImageSpec &spec, const char *name,
         int n = dirp->tdir_count;  // How many
         float *f = (float *) alloca (n * sizeof(float));
         for (int i = 0;  i < n;  ++i) {
-            unsigned int num, den;
+            int num, den;
             num = ((const int *) &(buf[dirp->tdir_offset]))[2*i+0];
             den = ((const int *) &(buf[dirp->tdir_offset]))[2*i+1];
             if (swab) {
@@ -413,7 +456,7 @@ add_exif_item_to_spec (ImageSpec &spec, const char *name,
     } else if (dirp->tdir_type == TIFF_ASCII) {
         int len = tiff_data_size (*dirp);
         const char *ptr = (len <= 4) ? (const char *)&dirp->tdir_offset 
-                                     : (buf + dirp->tdir_offset);
+                                     : (buf.data() + dirp->tdir_offset);
         while (len && ptr[len-1] == 0)  // Don't grab the terminating null
             --len;
         std::string str (ptr, len);
@@ -434,7 +477,7 @@ add_exif_item_to_spec (ImageSpec &spec, const char *name,
         spec.attribute (name, TypeDesc::UINT8, dirp->tdir_count, addr);
 #endif
     } else {
-#ifdef DEBUG
+#ifndef NDEBUG
         std::cerr << "didn't know how to process " << name << ", type " 
                   << dirp->tdir_type << " x " << dirp->tdir_count << "\n";
 #endif
@@ -454,9 +497,13 @@ add_exif_item_to_spec (ImageSpec &spec, const char *name,
 /// endianness of the file.
 static void
 read_exif_tag (ImageSpec &spec, const TIFFDirEntry *dirp,
-               const char *buf, bool swab, std::set<size_t> &ifd_offsets_seen,
+               string_view buf, bool swab,
+               std::set<size_t> &ifd_offsets_seen,
                const TagMap &tagmap)
 {
+    TagMap& exif_tagmap (exif_tagmap_ref());
+    TagMap& gps_tagmap (gps_tagmap_ref());
+
     // Make a copy of the pointed-to TIFF directory, swab the components
     // if necessary.
     TIFFDirEntry dir = *dirp;
@@ -480,6 +527,16 @@ read_exif_tag (ImageSpec &spec, const TIFFDirEntry *dirp,
         unsigned int offset = dirp->tdir_offset;  // int stored in offset itself
         if (swab)
             swap_endian (&offset);
+        if (offset >= buf.size()) {
+#if DEBUG_EXIF_READ
+            unsigned int off2 = offset;
+            swap_endian (&off2);
+            std::cerr << "Bad Exif block? ExifIFD has offset " << offset
+                      << " inexplicably greater than exif buffer length "
+                      << buf.size() << " (byte swapped = " << off2 << ")\n";
+#endif
+            return;
+        }
         // Don't recurse if we've already visited this IFD
         if (ifd_offsets_seen.find (offset) != ifd_offsets_seen.end()) {
 #if DEBUG_EXIF_READ
@@ -491,17 +548,28 @@ read_exif_tag (ImageSpec &spec, const TIFFDirEntry *dirp,
 #if DEBUG_EXIF_READ
         std::cerr << "Now we've seen offset " << offset << "\n";
 #endif
-        const unsigned char *ifd = ((const unsigned char *)buf + offset);
+        const unsigned char *ifd = ((const unsigned char *)buf.data() + offset);
         unsigned short ndirs = *(const unsigned short *)ifd;
         if (swab)
             swap_endian (&ndirs);
+        if (dir.tdir_tag == TIFFTAG_GPSIFD && ndirs > 32) {
+            // We have encountered JPEG files that inexplicably have the
+            // directory count for the GPS data using the wrong byte order.
+            // In this case, since there are only 32 possible GPS related
+            // tags, we use that as a sanity check and skip the corrupted
+            // data block. This isn't a very general solution, but it's a
+            // rare case and clearly a broken file. We're just trying not to
+            // crash in this case.
+            return;
+        }
+
 #if DEBUG_EXIF_READ
         std::cerr << "exifid has type " << dir.tdir_type << ", offset " << dir.tdir_offset << "\n";
         std::cerr << "EXIF Number of directory entries = " << ndirs << "\n";
 #endif
         for (int d = 0;  d < ndirs;  ++d)
             read_exif_tag (spec, (const TIFFDirEntry *)(ifd+2+d*sizeof(TIFFDirEntry)),
-                           (const char *)buf, swab, ifd_offsets_seen, 
+                           buf, swab, ifd_offsets_seen,
                            dir.tdir_tag == TIFFTAG_EXIFIFD ? exif_tagmap : gps_tagmap);
 #if DEBUG_EXIF_READ
         std::cerr << "> End EXIF\n";
@@ -519,7 +587,7 @@ read_exif_tag (ImageSpec &spec, const TIFFDirEntry *dirp,
 #if DEBUG_EXIF_READ
         std::cerr << "Now we've seen offset " << offset << "\n";
 #endif
-        const unsigned char *ifd = ((const unsigned char *)buf + offset);
+        const unsigned char *ifd = ((const unsigned char *)buf.data() + offset);
         unsigned short ndirs = *(const unsigned short *)ifd;
         if (swab)
             swap_endian (&ndirs);
@@ -529,7 +597,7 @@ read_exif_tag (ImageSpec &spec, const TIFFDirEntry *dirp,
 #endif
         for (int d = 0;  d < ndirs;  ++d)
             read_exif_tag (spec, (const TIFFDirEntry *)(ifd+2+d*sizeof(TIFFDirEntry)),
-                           (const char *)buf, swab, ifd_offsets_seen, exif_tagmap);
+                           buf, swab, ifd_offsets_seen, exif_tagmap);
 #if DEBUG_EXIF_READ
         std::cerr << "> End Interoperability\n\n";
 #endif
@@ -570,7 +638,7 @@ append_dir_entry (const TagMap &tagmap,
     dir.tdir_tag = tag;
     dir.tdir_type = type;
     dir.tdir_count = count;
-    int len = tiff_data_sizes[(int)type] * count;
+    size_t len = tiff_data_sizes[(int)type] * count;
     if (len <= 4) {
         dir.tdir_offset = 0;
         memcpy (&dir.tdir_offset, mydata, len);
@@ -580,10 +648,10 @@ append_dir_entry (const TagMap &tagmap,
     }
 #if DEBUG_EXIF_WRITE
     std::cerr << "Adding ";
-    print_dir_entry (tagmap, dir, (const char *)mydata);
+    print_dir_entry (tagmap, dir, string_view((const char *)mydata, len));
 #endif
     // Don't double-add
-    BOOST_FOREACH (TIFFDirEntry &d, dirs) {
+    for (TIFFDirEntry &d : dirs) {
         if (d.tdir_tag == tag) {
             d = dir;
             return;
@@ -698,7 +766,7 @@ static void
 reoffset (std::vector<TIFFDirEntry> &dirs, const TagMap &tagmap,
           size_t offset)
 {
-    BOOST_FOREACH (TIFFDirEntry &dir, dirs) {
+    for (TIFFDirEntry &dir : dirs) {
         if (tiff_data_size (dir) <= 4 &&
             dir.tdir_tag != TIFFTAG_EXIFIFD && dir.tdir_tag != TIFFTAG_GPSIFD) {
 #if DEBUG_EXIF_WRITE
@@ -719,21 +787,29 @@ reoffset (std::vector<TIFFDirEntry> &dirs, const TagMap &tagmap,
 }  // anon namespace
 
 
+// DEPRECATED (1.8)
+bool
+decode_exif (const void *exif, int length, ImageSpec &spec)
+{
+    return decode_exif (string_view ((const char *)exif, length), spec);
+}
+
+
 
 // Decode a raw Exif data block and save all the metadata in an
 // ImageSpec.  Return true if all is ok, false if the exif block was
 // somehow malformed.
 bool
-decode_exif (const void *exif, int length, ImageSpec &spec)
+decode_exif (string_view exif, ImageSpec &spec)
 {
-    const unsigned char *buf = (const unsigned char *) exif;
+    TagMap& exif_tagmap (exif_tagmap_ref());
 
 #if DEBUG_EXIF_READ
     std::cerr << "Exif dump:\n";
-    for (int i = 0;  i < length;  ++i) {
-        if (buf[i] >= ' ')
-            std::cerr << (char)buf[i] << ' ';
-        std::cerr << "(" << (int)(unsigned char)buf[i] << ") ";
+    for (size_t i = 0;  i < exif.size();  ++i) {
+        if (exif[i] >= ' ')
+            std::cerr << (char)exif[i] << ' ';
+        std::cerr << "(" << (int)(unsigned char)exif[i] << ") ";
     }
     std::cerr << "\n";
 #endif
@@ -747,7 +823,7 @@ decode_exif (const void *exif, int length, ImageSpec &spec)
     // N.B. Just read libtiff's "tiff.h" for info on the structure 
     // layout of TIFF headers and directory entries.  The TIFF spec
     // itself is also helpful in this area.
-    TIFFHeader head = *(const TIFFHeader *)buf;
+    TIFFHeader head = *(const TIFFHeader *)exif.data();
     if (head.tiff_magic != 0x4949 && head.tiff_magic != 0x4d4d)
         return false;
     bool host_little = littleendian();
@@ -762,13 +838,13 @@ decode_exif (const void *exif, int length, ImageSpec &spec)
 
     // Read the directory that the header pointed to.  It should contain
     // some number of directory entries containing tags to process.
-    const unsigned char *ifd = (buf + head.tiff_diroff);
+    const unsigned char *ifd = ((const unsigned char *)exif.data() + head.tiff_diroff);
     unsigned short ndirs = *(const unsigned short *)ifd;
     if (swab)
         swap_endian (&ndirs);
     for (int d = 0;  d < ndirs;  ++d)
         read_exif_tag (spec, (const TIFFDirEntry *) (ifd+2+d*sizeof(TIFFDirEntry)),
-                       (const char *)buf, swab, ifd_offsets_seen, exif_tagmap);
+                       exif, swab, ifd_offsets_seen, exif_tagmap);
 
     // A few tidbits to look for
     ImageIOParameter *p;
@@ -798,6 +874,9 @@ decode_exif (const void *exif, int length, ImageSpec &spec)
 void
 encode_exif (const ImageSpec &spec, std::vector<char> &blob)
 {
+    TagMap& exif_tagmap (exif_tagmap_ref());
+    TagMap& gps_tagmap (gps_tagmap_ref());
+
     // Reserve maximum space that an APP1 can take in a JPEG file, so
     // we can push_back to our heart's content and know that no offsets
     // or pointers to the exif vector's memory will change due to
@@ -846,7 +925,7 @@ encode_exif (const ImageSpec &spec, std::vector<char> &blob)
 
     // Go through all spec attribs, add them to the appropriate tag
     // directory (tiff, gps, or exif).
-    BOOST_FOREACH (const ImageIOParameter &p, spec.extra_attribs) {
+    for (const ImageIOParameter &p : spec.extra_attribs) {
         // Which tag domain are we using?
         if (! strncmp (p.name().c_str(), "GPS:", 4)) {
             // GPS
@@ -943,7 +1022,7 @@ encode_exif (const ImageSpec &spec, std::vector<char> &blob)
         reoffset (exifdirs, exif_tagmap, datastart);
         unsigned short nd = exifdirs.size();
         data.insert (data.end(), (char *)&nd, (char *)&nd + sizeof(nd));
-        data.insert (data.end(), (char *)&exifdirs[0], (char *)&exifdirs[exifdirs.size()]);
+        data.insert (data.end(), (char *)&exifdirs[0], (char *)(&exifdirs[0] + exifdirs.size()));
         data.insert (data.end(), (char *)&endmarker, (char *)&endmarker + sizeof(int));
     }
 
@@ -954,7 +1033,7 @@ encode_exif (const ImageSpec &spec, std::vector<char> &blob)
         reoffset (gpsdirs, gps_tagmap, datastart);
         unsigned short nd = gpsdirs.size();
         data.insert (data.end(), (char *)&nd, (char *)&nd + sizeof(nd));
-        data.insert (data.end(), (char *)&gpsdirs[0], (char *)&gpsdirs[gpsdirs.size()]);
+        data.insert (data.end(), (char *)&gpsdirs[0], (char *)(&gpsdirs[0] + gpsdirs.size()));
         data.insert (data.end(), (char *)&endmarker, (char *)&endmarker + sizeof(int));
     }
 
@@ -966,7 +1045,7 @@ encode_exif (const ImageSpec &spec, std::vector<char> &blob)
     std::cerr << "resulting exif block is a total of " << blob.size() << "\n";
 #if 0
     std::cerr << "APP1 dump:\n";
-    BOOST_FOREACH (char c, blob) {
+    for (char c : blob) {
         if (c >= ' ')
             std::cerr << c << ' ';
         std::cerr << "(" << (int)c << ") ";
@@ -976,6 +1055,20 @@ encode_exif (const ImageSpec &spec, std::vector<char> &blob)
 }
 
 
+
+bool
+exif_tag_lookup (string_view name, int &tag, int &tifftype, int &count)
+{
+    const EXIF_tag_info *e = exif_tagmap_ref().find (name);
+    if (! e)
+        return false;  // not found
+
+    tag = e->tifftag;
+    tifftype = e->tifftype;
+    count = e->tiffcount;
+    return true;
 }
-OIIO_NAMESPACE_EXIT
+
+
+OIIO_NAMESPACE_END
 

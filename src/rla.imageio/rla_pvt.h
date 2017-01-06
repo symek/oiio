@@ -165,7 +165,17 @@ namespace RLA_pvt {
         CT_FLOAT = 4
     };
 
-};  // namespace RLA_pvt
+    inline rla_channel_type rla_type (TypeDesc t) {
+        if (t == TypeDesc::UINT16)
+            return CT_WORD;
+        if (t == TypeDesc::UINT32)
+            return CT_DWORD;
+        if (t == TypeDesc::FLOAT)
+            return CT_FLOAT;
+        return CT_BYTE;
+    }
+
+}  // namespace RLA_pvt
 
 
 

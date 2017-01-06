@@ -28,7 +28,7 @@
   (This is the Modified BSD License)
 */
 
-
+#include "oiioversion.h"
 #include "fits_pvt.h"
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
@@ -50,6 +50,20 @@ OIIO_PLUGIN_EXPORTS_END
 
 
 
+int
+FitsOutput::supports (string_view feature) const
+{
+    return (feature == "multiimage"
+         || feature == "alpha"
+         || feature == "nchannels"
+         || feature == "random_access"
+         || feature == "arbitrary_metadata"
+         || feature == "exif"   // Because of arbitrary_metadata
+         || feature == "iptc"); // Because of arbitrary_metadata
+}
+
+
+
 bool
 FitsOutput::open (const std::string &name, const ImageSpec &spec,
                   OpenMode mode)
@@ -62,6 +76,8 @@ FitsOutput::open (const std::string &name, const ImageSpec &spec,
     // saving 'name' and 'spec' for later use
     m_filename = name;
     m_spec = spec;
+    if (m_spec.format == TypeDesc::UNKNOWN)  // if unknown, default to float
+        m_spec.set_format (TypeDesc::FLOAT);
 
     // checking if the file exists and can be opened in WRITE mode
     m_fd = Filesystem::fopen (m_filename, mode == AppendSubimage ? "r+b" : "wb");
@@ -75,6 +91,12 @@ FitsOutput::open (const std::string &name, const ImageSpec &spec,
     // now we can get the current position in the file
     // we will need it int the write_native_scanline method
     fgetpos(m_fd, &m_filepos);
+
+    // If user asked for tiles -- which this format doesn't support, emulate
+    // it by buffering the whole image.
+    if (m_spec.tile_width && m_spec.tile_height)
+        m_tilebuffer.resize (m_spec.image_bytes());
+
     return true;
 }
 
@@ -129,14 +151,13 @@ FitsOutput::write_scanline (int y, int z, TypeDesc format, const void *data,
 
 
 bool
-FitsOutput::supports (const std::string &feature) const
+FitsOutput::write_tile (int x, int y, int z, TypeDesc format,
+                       const void *data, stride_t xstride,
+                       stride_t ystride, stride_t zstride)
 {
-    // for now we only supports IMAGE extensions
-    if (feature == "multiimage")
-        return true;
-    if (feature == "random_access")
-        return true;
-    return false;
+    // Emulate tiles by buffering the whole image
+    return copy_tile_to_image_buffer (x, y, z, format, data, xstride,
+                                      ystride, zstride, &m_tilebuffer[0]);
 }
 
 
@@ -144,10 +165,23 @@ FitsOutput::supports (const std::string &feature) const
 bool
 FitsOutput::close (void)
 {
-    if (m_fd)
-        fclose (m_fd);
+    if (! m_fd) {   // already closed
+        init ();
+        return true;
+    }
+
+    bool ok = true;
+    if (m_spec.tile_width) {
+        // Handle tile emulation -- output the buffered pixels
+        ASSERT (m_tilebuffer.size());
+        ok &= write_scanlines (m_spec.y, m_spec.y+m_spec.height, 0,
+                               m_spec.format, &m_tilebuffer[0]);
+        std::vector<unsigned char>().swap (m_tilebuffer);
+    }
+
+    fclose (m_fd);
     init ();
-    return true;
+    return ok;
 }
 
 
@@ -182,7 +216,7 @@ FitsOutput::create_fits_header (void)
         // adding to the file
         std::vector<std::string> values;
         if (keyname == "Comment" || keyname == "History" || keyname == "Hierarch") {
-            pystring::split (value, values, m_sep);
+            Strutil::split (value, values, m_sep);
             for (size_t i = 0; i < values.size(); ++i)
                 header += create_card (keyname, values[i]);
             continue;
@@ -249,8 +283,10 @@ FitsOutput::create_basic_header (std::string &header)
             m_bitpix = -32;
             break;
         case TypeDesc::DOUBLE:
-        default:
             m_bitpix = -64;
+            break;
+        default:
+            m_bitpix = -32;  // punt: default to 32 bit float
             break;
     }
     header += create_card ("BITPIX", num2str (m_bitpix));

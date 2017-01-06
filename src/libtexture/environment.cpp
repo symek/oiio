@@ -33,24 +33,21 @@
 #include <string>
 #include <sstream>
 #include <list>
-#include <boost/tr1/memory.hpp>
-using namespace std::tr1;
 
 #include <OpenEXR/ImathMatrix.h>
 
-#include "dassert.h"
-#include "typedesc.h"
-#include "varyingref.h"
-#include "ustring.h"
-#include "strutil.h"
-#include "thread.h"
-#include "fmath.h"
-#include "filter.h"
-#include "imageio.h"
-
-#include "texture.h"
-
-#include "imagecache.h"
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/typedesc.h"
+#include "OpenImageIO/varyingref.h"
+#include "OpenImageIO/ustring.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/thread.h"
+#include "OpenImageIO/fmath.h"
+#include "OpenImageIO/filter.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/texture.h"
+#include "OpenImageIO/imagecache.h"
+#include "OpenImageIO/imagecache.h"
 #include "imagecache_pvt.h"
 #include "texture_pvt.h"
 
@@ -229,15 +226,15 @@ convention is dictated by OpenEXR.
 */
 
 
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
     using namespace pvt;
+    using namespace simd;
 
 namespace {  // anonymous
 
 static EightBitConverter<float> uchar2float;
 
-};  // end anonymous namespace
+}  // end anonymous namespace
 
 namespace pvt {   // namespace pvt
 
@@ -250,13 +247,48 @@ TextureSystemImpl::environment (ustring filename, TextureOptions &options,
                                 VaryingRef<Imath::V3f> R,
                                 VaryingRef<Imath::V3f> dRdx,
                                 VaryingRef<Imath::V3f> dRdy,
-                                float *result)
+                                int nchannels, float *result,
+                                float *dresultds, float *dresultdt)
 {
+    Perthread *thread_info = get_perthread_info();
+    TextureHandle *texture_handle = get_texture_handle (filename, thread_info);
+    return environment (texture_handle, thread_info, options,
+                        runflags, beginactive, endactive,
+                        R, dRdx, dRdy, nchannels, result, dresultds, dresultdt);
+}
+
+
+
+bool
+TextureSystemImpl::environment (TextureHandle *texture_handle,
+                                Perthread *thread_info, TextureOptions &options,
+                                Runflag *runflags,
+                                int beginactive, int endactive,
+                                VaryingRef<Imath::V3f> R,
+                                VaryingRef<Imath::V3f> dRdx,
+                                VaryingRef<Imath::V3f> dRdy,
+                                int nchannels, float *result,
+                                float *dresultds, float *dresultdt)
+{
+    if (! texture_handle)
+        return false;
     bool ok = true;
+    result += beginactive*nchannels;
+    if (dresultds) {
+        dresultds += beginactive*nchannels;
+        dresultdt += beginactive*nchannels;
+    }
     for (int i = beginactive;  i < endactive;  ++i) {
         if (runflags[i]) {
             TextureOpt opt (options, i);
-            ok &= environment (filename, opt, R[i], dRdx[i], dRdy[i], result);
+            ok &= environment (texture_handle, thread_info,
+                               opt, R[i], dRdx[i], dRdy[i],
+                               nchannels, result, dresultds, dresultdt);
+        }
+        result += nchannels;
+        if (dresultds) {
+            dresultds += nchannels;
+            dresultdt += nchannels;
         }
     }
     return ok;
@@ -289,12 +321,14 @@ bool
 TextureSystemImpl::environment (ustring filename, TextureOpt &options,
                                 const Imath::V3f &R,
                                 const Imath::V3f &dRdx, const Imath::V3f &dRdy,
-                                float *result)
+                                int nchannels, float *result,
+                                float *dresultds, float *dresultdt)
 {
     PerThreadInfo *thread_info = m_imagecache->get_perthread_info ();
     TextureFile *texturefile = find_texturefile (filename, thread_info);
     return environment ((TextureHandle *)texturefile, (Perthread *)thread_info,
-                        options, R, dRdx, dRdy, result);
+                        options, R, dRdx, dRdy,
+                        nchannels, result, dresultds, dresultdt);
 }
 
 
@@ -304,34 +338,58 @@ TextureSystemImpl::environment (TextureHandle *texture_handle_,
                                 Perthread *thread_info_,
                                 TextureOpt &options, const Imath::V3f &_R,
                                 const Imath::V3f &_dRdx, const Imath::V3f &_dRdy,
-                                float *result)
+                                int nchannels, float *result,
+                                float *dresultds, float *dresultdt)
 {
-    PerThreadInfo *thread_info = (PerThreadInfo *)thread_info_;
-    TextureFile *texturefile = (TextureFile *)texture_handle_;
+    // Handle >4 channel lookups by recursion.
+    if (nchannels > 4) {
+        int save_firstchannel = options.firstchannel;
+        while (nchannels) {
+            int n = std::min (nchannels, 4);
+            bool ok = environment (texture_handle_, thread_info_, options,
+                                   _R, _dRdx, _dRdy,
+                                   n, result, dresultds, dresultdt);
+            if (! ok)
+                return false;
+            result += n;
+            if (dresultds) dresultds += n;
+            if (dresultdt) dresultdt += n;
+            options.firstchannel += n;
+            nchannels -= n;
+        }
+        options.firstchannel = save_firstchannel; // restore what we changed
+        return true;
+    }
+
+    PerThreadInfo *thread_info = m_imagecache->get_perthread_info((PerThreadInfo *)thread_info_);
+    TextureFile *texturefile = verify_texturefile ((TextureFile *)texture_handle_, thread_info);
     ImageCacheStatistics &stats (thread_info->m_stats);
     ++stats.environment_batches;
     ++stats.environment_queries;
 
     if (! texturefile  ||  texturefile->broken())
-        return missing_texture (options, result);
+        return missing_texture (options, nchannels, result,
+                                dresultds, dresultdt);
 
     const ImageSpec &spec (texturefile->spec(options.subimage, 0));
 
-    options.swrap_func = texturefile->m_sample_border ?
-        wrap_periodic_sharedborder : wrap_periodic;
-    options.twrap_func = wrap_clamp;
+    // Environment maps dictate particular wrap modes
+    options.swrap = texturefile->m_sample_border ?
+        TextureOpt::WrapPeriodicSharedBorder : TextureOpt::WrapPeriodic;
+    options.twrap = TextureOpt::WrapClamp;
+
     options.envlayout = LayoutLatLong;
     int actualchannels = Imath::clamp (spec.nchannels - options.firstchannel,
-                                       0, options.nchannels);
-    options.actualchannels = actualchannels;
+                                       0, nchannels);
 
     // Initialize results to 0.  We'll add from here on as we sample.
-    float* dresultds = options.dresultds;
-    float* dresultdt = options.dresultdt;
-    for (int c = 0;  c < options.actualchannels;  ++c) {
+    for (int c = 0;  c < nchannels;  ++c)
         result[c] = 0;
-        if (dresultds) dresultds[c] = 0;
-        if (dresultdt) dresultdt[c] = 0;
+    if (dresultds) {
+        for (int c = 0;  c < nchannels;  ++c)
+            dresultds[c] = 0;
+        for (int c = 0;  c < nchannels;  ++c)
+            dresultdt[c] = 0;
     }
     // If the user only provided us with one pointer, clear both to simplify
     // the rest of the code, but only after we zero out the data for them so
@@ -345,8 +403,8 @@ TextureSystemImpl::environment (TextureHandle *texture_handle_,
     Imath::V3f Rx = _R + _dRdx;  Rx.normalize();  // x axis of the ellipse
     Imath::V3f Ry = _R + _dRdy;  Ry.normalize();  // y axis of the ellipse
     // angles formed by the ellipse axes.
-    float xfilt_noblur = std::max (safe_acosf(R.dot(Rx)), 1e-8f);
-    float yfilt_noblur = std::max (safe_acosf(R.dot(Ry)), 1e-8f);
+    float xfilt_noblur = std::max (safe_acos(R.dot(Rx)), 1e-8f);
+    float yfilt_noblur = std::max (safe_acos(R.dot(Ry)), 1e-8f);
     int naturalres = int((float)M_PI / std::min (xfilt_noblur, yfilt_noblur));
     // FIXME -- figure naturalres sepearately for s and t
     // FIXME -- ick, why is it x and y at all, shouldn't it be s and t?
@@ -370,23 +428,23 @@ TextureSystemImpl::environment (TextureHandle *texture_handle_,
         minorlength = xfilt;
     }
 
-    accum_prototype accumer;
+    sampler_prototype sampler;
     long long *probecount;
     switch (options.interpmode) {
     case TextureOpt::InterpClosest :
-        accumer = &TextureSystemImpl::accum_sample_closest;
+        sampler = &TextureSystemImpl::sample_closest;
         probecount = &stats.closest_interps;
         break;
     case TextureOpt::InterpBilinear :
-        accumer = &TextureSystemImpl::accum_sample_bilinear;
+        sampler = &TextureSystemImpl::sample_bilinear;
         probecount = &stats.bilinear_interps;
         break;
     case TextureOpt::InterpBicubic :
-        accumer = &TextureSystemImpl::accum_sample_bicubic;
+        sampler = &TextureSystemImpl::sample_bicubic;
         probecount = &stats.cubic_interps;
         break;
     default:
-        accumer = NULL;
+        sampler = NULL;
         probecount = NULL;
         break;
     }
@@ -440,7 +498,7 @@ TextureSystemImpl::environment (TextureHandle *texture_handle_,
             if (filtwidth_ras <= 1) {
                 miplevel[0] = m-1;
                 miplevel[1] = m;
-                levelblend = Imath::clamp (2.0f - 1.0f/filtwidth_ras, 0.0f, 1.0f);
+                levelblend = Imath::clamp (2.0f*filtwidth_ras - 1.0f, 0.0f, 1.0f);
                 break;
             }
         }
@@ -479,34 +537,46 @@ TextureSystemImpl::environment (TextureHandle *texture_handle_,
             if (options.interpmode == TextureOpt::InterpSmartBicubic) {
                 if (lev == 0 ||
                     (texturefile->spec(options.subimage,lev).full_height < naturalres/2)) {
-                    accumer = &TextureSystemImpl::accum_sample_bicubic;
+                    sampler = &TextureSystemImpl::sample_bicubic;
                     ++stats.cubic_interps;
                 } else {
-                    accumer = &TextureSystemImpl::accum_sample_bilinear;
+                    sampler = &TextureSystemImpl::sample_bilinear;
                     ++stats.bilinear_interps;
                 }
             } else {
                 *probecount += 1;
             }
 
-            ok &= (this->*accumer) (s, t, miplevel[level], *texturefile,
-                                    thread_info, options,
-                                    levelweight[level]*invsamples, result,
-                                    dresultds, dresultdt);
+            OIIO_SIMD4_ALIGN float sval[4] = { s, 0.0f, 0.0f, 0.0f };
+            OIIO_SIMD4_ALIGN float tval[4] = { t, 0.0f, 0.0f, 0.0f };
+            OIIO_SIMD4_ALIGN float weight[4] = { levelweight[level]*invsamples,
+                                                 0.0f, 0.0f, 0.0f };
+            float4 r, drds, drdt;
+            ok &= (this->*sampler) (1, sval, tval, miplevel[level],
+                                    *texturefile, thread_info, options,
+                                    nchannels, actualchannels, weight,
+                                    &r, dresultds ? &drds : NULL, dresultds ? &drdt : NULL);
+            for (int c = 0; c < nchannels; ++c)
+                result[c] += r[c];
+            if (dresultds) {
+                for (int c = 0; c < nchannels; ++c) {
+                    dresultds[c] += drds[c];
+                    dresultdt[c] += drdt[c];
+                }
+            }
         }
     }
     stats.aniso_probes += nsamples;
     ++stats.aniso_queries;
 
-    if (actualchannels < options.nchannels)
-        fill_channels (spec, options, result);
+    if (actualchannels < nchannels && options.firstchannel == 0 && m_gray_to_rgb)
+        fill_gray_channels (spec, nchannels, result, dresultds, dresultdt);
 
     return ok;
 }
 
 
 
-};  // end namespace pvt
+}  // end namespace pvt
 
-}
-OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END

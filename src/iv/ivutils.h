@@ -1,10 +1,9 @@
 #ifndef OPENIMAGEIO_IV_UTILS_H
 #define OPENIMAGEIO_IV_UTILS_H
 
-#include "fmath.h"
+#include "OpenImageIO/fmath.h"
 
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 /// Round up to the next power of 2
 /// TODO: This should be optimized to use bit arithmetic on the ieee float
@@ -30,7 +29,6 @@ pow2rounddownf (float f)
     return powf (2.0f, floorf (logval));
 }
 
-}
-OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END
 
 #endif // OPENIMAGEIO_IV_UTILS_H

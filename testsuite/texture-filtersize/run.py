@@ -1,4 +1,4 @@
-#!/usr/bin/python 
+#!/usr/bin/env python
 
 # This test verifies that the TextureSystem is sampling the correct
 # MIPmap levels given the input derivatives.
@@ -37,5 +37,5 @@
 
 
 command = testtex_command (parent + "/oiio-images/miplevels.tx",
-                           " --filtertest -d half -res 256 256")
-outputs = [ "out.exr" ]
+                           " --filtertest -res 256 256 -d uint8 -o out.tif")
+outputs = [ "out.tif" ]

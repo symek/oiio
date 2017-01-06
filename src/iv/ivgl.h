@@ -42,17 +42,14 @@
 #endif
 
 // included to remove std::min/std::max errors
-#include "osdep.h"
+#include "OpenImageIO/platform.h"
 
 #include <vector>
 
-// This needs to be included before GL.h
-#include <glew.h>
+#include <QGLWidget>
 
-#include <QtOpenGL/QGLWidget>
-
-#include "imageio.h"
-#include "imagebuf.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/imagebuf.h"
 
 OIIO_NAMESPACE_USING;
 

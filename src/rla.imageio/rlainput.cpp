@@ -33,11 +33,11 @@
 #include <cmath>
 #include <cassert>
 
-#include "dassert.h"
-#include "typedesc.h"
-#include "imageio.h"
-#include "filesystem.h"
-#include "fmath.h"
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/typedesc.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/fmath.h"
 
 #include "rla_pvt.h"
 
@@ -155,6 +155,8 @@ OIIO_EXPORT ImageInput *rla_input_imageio_create () { return new RLAInput; }
 
 OIIO_EXPORT int rla_imageio_version = OIIO_PLUGIN_VERSION;
 
+OIIO_EXPORT const char* rla_imageio_library_version () { return NULL; }
+
 OIIO_EXPORT const char * rla_input_extensions[] = {
     "rla", NULL
 };
@@ -271,7 +273,7 @@ RLAInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
                    + 7) / 8;
     int nchannels = m_rla.NumOfColorChannels + m_rla.NumOfMatteChannels
                                              + m_rla.NumOfAuxChannels;
-    TypeDesc maxtype = (maxbytes == 4) ? TypeDesc::UINT32
+    TypeDesc maxtype = (maxbytes == 4) ? TypeDesc::FLOAT
                      : (maxbytes == 2 ? TypeDesc::UINT16 : TypeDesc::UINT8);
     if (nchannels < 1 || nchannels > 16 ||
         (maxbytes != 1 && maxbytes != 2 && maxbytes != 4)) {
@@ -288,14 +290,15 @@ RLAInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
     
     // set window dimensions etc.
     m_spec.x = m_rla.ActiveLeft;
-    m_spec.y = m_spec.height - m_rla.ActiveTop - 1;
+    m_spec.y = m_spec.height-1 - m_rla.ActiveTop;
     m_spec.full_width = m_rla.WindowRight - m_rla.WindowLeft + 1;
     m_spec.full_height = m_rla.WindowTop - m_rla.WindowBottom + 1;
     m_spec.full_depth = 1;
     m_spec.full_x = m_rla.WindowLeft;
-    m_spec.full_y = m_spec.full_height - m_rla.WindowTop - 1;
+    m_spec.full_y = m_spec.full_height-1 - m_rla.WindowTop;
 
     // set channel formats and stride
+    int z_channel = -1;
     m_stride = 0;
     TypeDesc t = get_channel_typedesc (m_rla.ColorChannelType, m_rla.NumOfChannelBits);
     for (int i = 0; i < m_rla.NumOfColorChannels; ++i)
@@ -304,10 +307,22 @@ RLAInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
     t = get_channel_typedesc (m_rla.MatteChannelType, m_rla.NumOfMatteBits);
     for (int i = 0; i < m_rla.NumOfMatteChannels; ++i)
         m_spec.channelformats.push_back (t);
+    if (m_rla.NumOfMatteChannels >= 1)
+        m_spec.alpha_channel = m_rla.NumOfColorChannels;
+    else
+        m_spec.alpha_channel = -1;
     m_stride += m_rla.NumOfMatteChannels * t.size ();
     t = get_channel_typedesc (m_rla.AuxChannelType, m_rla.NumOfAuxBits);
-    for (int i = 0; i < m_rla.NumOfAuxChannels; ++i)
+    for (int i = 0; i < m_rla.NumOfAuxChannels; ++i) {
         m_spec.channelformats.push_back (t);
+        // assume first float aux or 32 bit int channel is z
+        if (z_channel < 0 && (t == TypeDesc::FLOAT || t == TypeDesc::INT32 ||
+                              t == TypeDesc::UINT32)) {
+            z_channel = m_rla.NumOfColorChannels + m_rla.NumOfMatteChannels;
+            m_spec.z_channel = z_channel;
+            m_spec.channelnames[z_channel] = "Z";
+        }
+    }
     m_stride += m_rla.NumOfAuxChannels * t.size ();
 
     // But if all channels turned out the same, just use 'format' and don't
@@ -322,8 +337,6 @@ RLAInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
         // N.B. don't set bps for mixed formats, it isn't well defined
     }
 
-    // make a guess at channel names for the time being
-    m_spec.default_channel_names ();
     // this is always true
     m_spec.attribute ("compression", "rle");
     
@@ -438,7 +451,7 @@ RLAInput::decode_rle_span (unsigned char *buf, int n, int stride,
 {
     size_t e = 0;
     while (n > 0 && e < elen) {
-        char count = encoded[e++];
+        signed char count = (signed char) encoded[e++];
         if (count >= 0) {
             // run count positive: value repeated count+1 times
             for (int i = 0;  i <= count && n;  ++i, buf += stride, --n)
@@ -589,7 +602,7 @@ bool
 RLAInput::read_native_scanline (int y, int z, void *data)
 {
     // By convention, RLA images store their images bottom-to-top.
-    y = m_spec.height - y - 1;
+    y = m_spec.height - (y - m_spec.y) - 1;
 
     // Seek to scanline start, based on the scanline offset table
     fseek (m_file, m_sot[y], SEEK_SET);

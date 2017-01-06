@@ -28,13 +28,14 @@
   (This is the Modified BSD License)
 */
 #include "sgi_pvt.h"
-#include "dassert.h"
+#include "OpenImageIO/dassert.h"
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
 
 // Obligatory material to make this a recognizeable imageio plugin:
 OIIO_PLUGIN_EXPORTS_BEGIN
     OIIO_EXPORT int sgi_imageio_version = OIIO_PLUGIN_VERSION;
+    OIIO_EXPORT const char* sgi_imageio_library_version () { return NULL; }
     OIIO_EXPORT ImageInput *sgi_input_imageio_create () {
         return new SgiInput;
     }
@@ -242,14 +243,13 @@ SgiInput::uncompress_rle_channel(int scanline_off, int scanline_len,
             }
             // If the high bit is zero, we copy the NEXT value, count times
             else {
-                value = (rle_scanline[i] << 8) | rle_scanline[i+1];
-                i += 2;
                 while (count--) {
                     DASSERT (limit > 0);
-                    *(unsigned short *)out = value;
-                    out += 2;
+                    *(out++) = rle_scanline[i];
+                    *(out++) = rle_scanline[i+1];
                     --limit;
                 }
+                i += 2;
             }
         }
     }

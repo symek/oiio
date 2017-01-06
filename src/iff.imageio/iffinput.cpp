@@ -39,6 +39,7 @@ using namespace iff_pvt;
 OIIO_PLUGIN_EXPORTS_BEGIN
 
     OIIO_EXPORT int iff_imageio_version = OIIO_PLUGIN_VERSION;
+    OIIO_EXPORT const char* iff_imageio_library_version () { return NULL; }
     OIIO_EXPORT ImageInput *iff_input_imageio_create () {
         return new IffInput;
     }
@@ -371,7 +372,7 @@ IffInput::readimg()
                 std::vector<uint8_t> map;
                 if (littleendian()) {
                     int rgb16[] = { 0, 2, 4, 1, 3, 5 };
-                    int rgba16[] = { 0, 2, 4, 7, 1, 3, 5, 6 };
+                    int rgba16[] = { 0, 2, 4, 6, 1, 3, 5, 7 };
                     if (m_iff_header.pixel_channels == 3) {
                         map = std::vector<uint8_t>( rgb16, &rgb16[6] );
                     } else {

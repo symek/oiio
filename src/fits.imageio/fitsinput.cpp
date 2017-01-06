@@ -30,6 +30,7 @@
 
 
 #include <cstdlib>
+#include <ctype.h>
 
 #include "fits_pvt.h"
 
@@ -41,6 +42,7 @@ OIIO_PLUGIN_NAMESPACE_BEGIN
 OIIO_PLUGIN_EXPORTS_BEGIN
 
     OIIO_EXPORT int fits_imageio_version = OIIO_PLUGIN_VERSION;
+    OIIO_EXPORT const char* fits_imageio_library_version () { return NULL; }
     OIIO_EXPORT ImageInput *fits_input_imageio_create () {
         return new FitsInput;
     }
@@ -279,6 +281,8 @@ FitsInput::read_fits_header (void)
         }
         if (keyname == "NAXIS") {
             m_naxes = atoi (&card[10]);
+            if (m_naxes == 1)  // 1 axis is w x 1 image
+                m_spec.height = m_spec.full_height = 1;
             continue;
         }
         if (keyname == "NAXIS1") {
@@ -316,7 +320,10 @@ FitsInput::read_fits_header (void)
             continue;
         }
 
-        add_to_spec (pystring::capitalize(keyname), value);
+        Strutil::to_lower (keyname);  // make lower case
+        if (keyname.size() >= 1)
+            keyname[0] = toupper (keyname[0]);
+        add_to_spec (keyname, value);
     }
     // if we didn't found END keyword in current header, we read next one
     return read_fits_header ();

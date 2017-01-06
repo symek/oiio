@@ -31,8 +31,8 @@
 #ifndef OPENIMAGEIO_TARGA_PVT_H
 #define OPENIMAGEIO_TARGA_PVT_H
 
-#include "filesystem.h"
-#include "fmath.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/fmath.h"
 
 
 
@@ -100,7 +100,7 @@ enum tga_alpha_type {
     // values 128-255 are unassigned
 };
 
-};  // namespace TGA_pvt
+}  // namespace TGA_pvt
 
 
 

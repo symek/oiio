@@ -35,16 +35,18 @@
 #include <ctime>
 #include <iostream>
 #include <iterator>
+#include <memory>
 
-#include <boost/foreach.hpp>
 #include <boost/regex.hpp>
 
-#include "argparse.h"
-#include "strutil.h"
-#include "imageio.h"
-#include "imagebuf.h"
-#include "imagebufalgo.h"
-#include "hash.h"
+#include "OpenImageIO/argparse.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/imagebuf.h"
+#include "OpenImageIO/imagebufalgo.h"
+#include "OpenImageIO/deepdata.h"
+#include "OpenImageIO/hash.h"
+#include "OpenImageIO/filesystem.h"
 
 OIIO_NAMESPACE_USING;
 
@@ -77,20 +79,20 @@ print_sha1 (ImageInput *input)
             return;
         }
         // Hash both the sample counds and the data block
-        sha.appendvec (dd.nsamples);
-        sha.appendvec (dd.data);
+        sha.append (dd.all_samples());
+        sha.append (dd.all_data());
     } else {
         imagesize_t size = input->spec().image_bytes (true /*native*/);
         if (size >= std::numeric_limits<size_t>::max()) {
             printf ("    SHA-1: unable to compute, image is too big\n");
             return;
         }
-        std::vector<unsigned char> buf((size_t)size);
+        std::unique_ptr<char[]> buf (new char [size]);
         if (! input->read_image (TypeDesc::UNKNOWN /*native*/, &buf[0])) {
             printf ("    SHA-1: unable to compute, could not read image\n");
             return;
         }
-        sha.appendvec (buf);
+        sha.append (&buf[0], size);
     }
 
     printf ("    SHA-1: %s\n", sha.digest().c_str());
@@ -193,6 +195,8 @@ print_stats (const std::string &filename,
     
     if (! computePixelStats (stats, input)) {
         printf ("%sStats: (unable to compute)\n", indent);
+        if (input.has_error())
+            std::cerr << "Error: " << input.geterror() << "\n";
         return;
     }
     
@@ -252,11 +256,11 @@ print_stats (const std::string &filename,
 
     if (input.deep()) {
         const DeepData *dd (input.deepdata());
-        size_t npixels = dd->nsamples.size();
+        size_t npixels = dd->pixels();
         size_t totalsamples = 0, emptypixels = 0;
         size_t maxsamples = 0, minsamples = std::numeric_limits<size_t>::max();
         for (size_t p = 0;  p < npixels;  ++p) {
-            int c = dd->nsamples[p];
+            size_t c = dd->samples(p);
             totalsamples += c;
             if (c > maxsamples)
                 maxsamples = c;
@@ -372,8 +376,8 @@ print_metadata (const ImageSpec &spec, const std::string &filename)
             printed = true;
         }
     }
-    
-    BOOST_FOREACH (const ImageIOParameter &p, spec.extra_attribs) {
+
+    for (auto&& p : spec.extra_attribs) {
         if (! metamatch.empty() &&
             ! boost::regex_search (p.name().c_str(), field_re))
             continue;
@@ -416,6 +420,27 @@ extended_format_name (TypeDesc type, int bits)
 
 
 
+static const char *
+brief_format_name (TypeDesc type, int bits=0)
+{
+    if (! bits)
+        bits = (int)type.size()*8;
+    if (type.is_floating_point()) {
+        if (type.basetype == TypeDesc::FLOAT)
+            return "f";
+        if (type.basetype == TypeDesc::HALF)
+            return "h";
+        return ustring::format("f%d", bits).c_str();
+    } else if (type.is_signed()) {
+        return ustring::format("i%d", bits).c_str();
+    } else {
+        return ustring::format("u%d", bits).c_str();
+    }
+    return type.c_str();  // use the name implied by type
+}
+
+
+
 // prints basic info (resolution, width, height, depth, channels, data format,
 // and format name) about given subimage.
 static void
@@ -443,8 +468,8 @@ print_info_subimage (int current_subimage, int max_subimages, ImageSpec &spec,
         int bits = spec.get_int_attribute ("oiio:BitsPerSample", 0);
         printf (", %d channel, %s%s%s", spec.nchannels,
                 spec.deep ? "deep " : "",
-                extended_format_name(spec.format, bits),
-                spec.depth > 1 ? " volume" : "");
+                spec.depth > 1 ? "volume " : "",
+                extended_format_name(spec.format, bits));
         printf (" %s", input->format_name());
         printf ("\n");
     }
@@ -533,9 +558,9 @@ print_info (const std::string &filename, size_t namefieldlength,
                 spec.width, spec.height);
         if (spec.depth > 1)
             printf (" x %4d", spec.depth);
-        printf (", %d channel, ", spec.nchannels);
-        if (spec.deep)
-            printf ("deep ");
+        printf (", %d channel, %s%s", spec.nchannels,
+                spec.deep ? "deep " : "",
+                spec.depth > 1 ? "volume " : "");
         if (spec.channelformats.size()) {
             for (size_t c = 0;  c < spec.channelformats.size();  ++c)
                 printf ("%s%s", c ? "/" : "",
@@ -544,8 +569,6 @@ print_info (const std::string &filename, size_t namefieldlength,
             int bits = spec.get_int_attribute ("oiio:BitsPerSample", 0);
             printf ("%s", extended_format_name(spec.format, bits));
         }
-        if (spec.depth > 1)
-            printf (" volume");
         printf (" %s", input->format_name());
         if (sum) {
             imagesize_t imagebytes = spec.image_bytes (true);
@@ -562,15 +585,27 @@ print_info (const std::string &filename, size_t namefieldlength,
         printf ("\n");
     }
 
+    int movie = spec.get_int_attribute ("oiio:Movie");
     if (verbose && num_of_subimages != 1) {
         // info about num of subimages and their resolutions
         printf ("    %d subimages: ", num_of_subimages);
         for (int i = 0; i < num_of_subimages; ++i) {
             input->seek_subimage (i, 0, spec);
+            int bits = spec.get_int_attribute ("oiio:BitsPerSample",
+                                               spec.format.size()*8);
+            if (i)
+                printf (", ");
             if (spec.depth > 1)
                 printf ("%dx%dx%d ", spec.width, spec.height, spec.depth);
             else
                 printf ("%dx%d ", spec.width, spec.height);
+            // printf ("[");
+            for (int c = 0; c < spec.nchannels; ++c)
+                printf ("%c%s", c ? ',' : '[',
+                        brief_format_name(spec.channelformat(c), bits));
+            printf ("]");
+            if (movie)
+                break;
         }
         printf ("\n");
     }
@@ -599,6 +634,7 @@ parse_files (int argc, const char *argv[])
 int
 main (int argc, const char *argv[])
 {
+    Filesystem::convert_native_arguments (argc, (const char **)argv);
     ArgParse ap;
     ap.options ("iinfo -- print information about images\n"
                 OIIO_INTRO_STRING "\n"
@@ -629,12 +665,12 @@ main (int argc, const char *argv[])
 
     // Find the longest filename
     size_t longestname = 0;
-    BOOST_FOREACH (const std::string &s, filenames)
+    for (auto&& s : filenames)
         longestname = std::max (longestname, s.length());
     longestname = std::min (longestname, (size_t)40);
 
     long long totalsize = 0;
-    BOOST_FOREACH (const std::string &s, filenames) {
+    for (auto&& s : filenames) {
         ImageInput *in = ImageInput::open (s.c_str());
         if (! in) {
             std::string err = geterror();

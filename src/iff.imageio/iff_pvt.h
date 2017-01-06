@@ -34,9 +34,9 @@
 //                   Autodesk Maya documentation, ilib.h
 
 #include <cstdio>
-#include "imageio.h"
-#include "filesystem.h"
-#include "fmath.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/fmath.h"
 
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
@@ -61,9 +61,6 @@ namespace iff_pvt {
         // reads information about IFF file
         bool read_header (FILE *fd);
         
-        // writes information about iff file to give file
-        bool write_header (FILE *fd);
-          
         // header information
         uint32_t x;
         uint32_t y;
@@ -133,8 +130,7 @@ namespace iff_pvt {
         uint32_t th = tile_height();
         return (height + th - 1) / th;
     }
-    
-    
+
 } // namespace iff_pvt
 
 
@@ -142,7 +138,7 @@ namespace iff_pvt {
 class IffInput : public ImageInput {
 public:
     IffInput () { init(); }
-    virtual ~IffInput () { }
+    virtual ~IffInput () { close(); }
     virtual const char *format_name (void) const { return "iff"; }
     virtual bool open (const std::string &name, ImageSpec &spec);
     virtual bool close (void);
@@ -167,9 +163,44 @@ private:
     bool readimg (void);
     
     // helper to uncompress a rle channel
-    size_t uncompress_rle_channel(
-        const uint8_t * in, uint8_t * out, int size
-    );
+    size_t uncompress_rle_channel(const uint8_t *in, uint8_t * out, int size);
+
+    bool read_short (uint16_t& val) {
+        bool ok = fread (&val, sizeof(val), 1, m_fd);
+        if (littleendian())
+            swap_endian (&val);
+        return ok;
+    }
+
+    bool read_int (uint32_t& val) {
+        bool ok = fread (&val, sizeof(val), 1, m_fd);
+        if (littleendian())
+            swap_endian (&val);
+        return ok;
+    }
+
+    bool read_str (std::string &val, uint32_t len, uint32_t round = 4) {
+        const uint32_t big = 1024;
+        char strbuf[big];
+        len = std::min (len, big);
+        bool ok = fread (strbuf, len, 1, m_fd);
+        val.assign (strbuf, len);
+        for (uint32_t pad = len%round; pad; --pad)
+            fgetc (m_fd);
+        return ok;
+    }
+
+    bool read_type_len (std::string &type, uint32_t &len) {
+        return read_str (type, 4)
+            && read_int (len);
+    }
+
+    bool read_meta_string (std::string &name, std::string &val) {
+        uint32_t len = 0;
+        return read_type_len (name, len)
+            && read_str (val, len);
+    }
+
 };
 
 
@@ -179,7 +210,7 @@ public:
     IffOutput () { init (); }
     virtual ~IffOutput () { close (); }
     virtual const char *format_name (void) const { return "iff"; }
-    virtual bool supports (const std::string &feature) const;
+    virtual int supports (string_view feature) const;
     virtual bool open (const std::string &name, const ImageSpec &spec,
                        OpenMode mode);
     virtual bool close (void);
@@ -193,26 +224,52 @@ private:
     std::string m_filename;
     iff_pvt::IffFileHeader m_iff_header;
     std::vector<uint8_t> m_buf;
-    
+    unsigned int m_dither;
+    std::vector<uint8_t> scratch;    
+
     void init (void) {
         m_fd = NULL;
         m_filename.clear ();
     }
-    
+
+    // writes information about iff file to give file
+    bool write_header (iff_pvt::IffFileHeader &header);
+
+    bool write_short (uint16_t val) {
+        if (littleendian())
+            swap_endian (&val);
+        return fwrite (&val, sizeof(val), 1, m_fd);
+    }
+    bool write_int (uint32_t val) {
+        if (littleendian())
+            swap_endian (&val);
+        return fwrite (&val, sizeof(val), 1, m_fd);
+    }
+
+    bool write_str (string_view val, size_t round = 4) {
+        bool ok = fwrite (val.data(), val.size(), 1, m_fd);
+        for (size_t i = val.size(); i < round_to_multiple(val.size(), round); ++i)
+            ok &= (fputc (' ', m_fd) != EOF);
+        return ok;
+    }
+
+    bool write_meta_string (string_view name, string_view val,
+                            bool write_if_empty = false) {
+        if (val.empty() && ! write_if_empty)
+            return true;
+        return write_str (name)
+            && write_int (int(val.size()))
+            && (val.size() == 0 || write_str (val));
+    }
+
     // helper to compress verbatim
-    void compress_verbatim (
-        const uint8_t *& in, uint8_t *& out, int size
-    );
+    void compress_verbatim (const uint8_t *& in, uint8_t *& out, int size);
       
     // helper to compress duplicate
-    void compress_duplicate (
-        const uint8_t *&in, uint8_t *& out, int size
-    );
+    void compress_duplicate (const uint8_t *&in, uint8_t *& out, int size);
       
     // helper to compress a rle channel
-    size_t compress_rle_channel (
-        const uint8_t *in, uint8_t *out, int size
-    );
+    size_t compress_rle_channel (const uint8_t *in, uint8_t *out, int size);
 };
 
 OIIO_PLUGIN_NAMESPACE_END

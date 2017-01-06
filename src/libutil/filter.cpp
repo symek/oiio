@@ -48,14 +48,14 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <iostream>
 
-#include "fmath.h"
-#include "filter.h"
-#include "dassert.h"
+#include "OpenImageIO/fmath.h"
+#include "OpenImageIO/filter.h"
+#include "OpenImageIO/dassert.h"
 
 
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 // Below are the implementations of several 2D filters.  They all
 // inherit their interface from Filter2D.  Each must redefine two
@@ -71,7 +71,7 @@ public:
     float operator() (float x) const {
         return (fabsf(x) <= m_w*0.5f) ? 1.0f : 0.0f;
     }
-    const std::string name (void) const { return "box"; }
+    string_view name (void) const { return "box"; }
 };
 
 
@@ -86,7 +86,7 @@ public:
     bool separable (void) const { return true; }
     float xfilt (float x) const { return fabsf(x) <= m_w*0.5f ? 1.0f : 0.0f; }
     float yfilt (float y) const { return fabsf(y) <= m_h*0.5f ? 1.0f : 0.0f; }
-    const std::string name (void) const { return "box"; }
+    string_view name (void) const { return "box"; }
 };
 
 
@@ -98,7 +98,7 @@ public:
     float operator() (float x) const {
         return tri1d (x * m_rad_inv);
     }
-    const std::string name (void) const { return "triangle"; }
+    string_view name (void) const { return "triangle"; }
 
     static float tri1d (float x) {
         x = fabsf(x);
@@ -127,7 +127,7 @@ public:
     float yfilt (float y) const {
         return FilterTriangle1D::tri1d (y * m_hrad_inv);
     }
-    const std::string name (void) const { return "triangle"; }
+    string_view name (void) const { return "triangle"; }
 private:
     float m_wrad_inv, m_hrad_inv;
 };
@@ -143,9 +143,9 @@ public:
     }
     static float gauss1d (float x) {
         x = fabsf(x);
-        return (x < 1.0f) ? expf (-2.0f * (x*x)) : 0.0f;
+        return (x < 1.0f) ? fast_exp (-2.0f * (x*x)) : 0.0f;
     }
-    const std::string name (void) const { return "gaussian"; }
+    string_view name (void) const { return "gaussian"; }
 private:
     float m_rad_inv;
 };
@@ -169,7 +169,49 @@ public:
     float yfilt (float y) const {
         return FilterGaussian1D::gauss1d (y * m_hrad_inv);
     }
-    const std::string name (void) const { return "gaussian"; }
+    string_view name (void) const { return "gaussian"; }
+private:
+    float m_wrad_inv, m_hrad_inv;
+};
+
+
+
+class FilterSharpGaussian1D : public Filter1D {
+public:
+    FilterSharpGaussian1D (float width) : Filter1D(width), m_rad_inv(2.0f/width) { }
+    ~FilterSharpGaussian1D (void) { }
+    float operator() (float x) const {
+        return gauss1d (x * m_rad_inv);
+    }
+    static float gauss1d (float x) {
+        x = fabsf(x);
+        return (x < 1.0f) ? fast_exp (-4.0f * (x*x)) : 0.0f;
+    }
+    string_view name (void) const { return "gaussian"; }
+private:
+    float m_rad_inv;
+};
+
+
+
+class FilterSharpGaussian2D : public Filter2D {
+public:
+    FilterSharpGaussian2D (float width, float height) 
+        : Filter2D(width,height), m_wrad_inv(2.0f/width),
+          m_hrad_inv(2.0f/height) { }
+    ~FilterSharpGaussian2D (void) { }
+    float operator() (float x, float y) const {
+        return FilterSharpGaussian1D::gauss1d (x * m_wrad_inv)
+             * FilterSharpGaussian1D::gauss1d (y * m_hrad_inv);
+    }
+    bool separable (void) const { return true; }
+    float xfilt (float x) const {
+        return FilterSharpGaussian1D::gauss1d (x * m_wrad_inv);
+    }
+    float yfilt (float y) const {
+        return FilterSharpGaussian1D::gauss1d (y * m_hrad_inv);
+    }
+    string_view name (void) const { return "gaussian"; }
 private:
     float m_wrad_inv, m_hrad_inv;
 };
@@ -178,10 +220,11 @@ private:
 
 class FilterCatmullRom1D : public Filter1D {
 public:
-    FilterCatmullRom1D (float width) : Filter1D(4.0f) { }
+    FilterCatmullRom1D (float width)
+        : Filter1D(4.0f), m_scale(4.0f/width) { }
     ~FilterCatmullRom1D (void) { }
-    float operator() (float x) const { return catrom1d(x); }
-    const std::string name (void) const { return "catmull-rom"; }
+    float operator() (float x) const { return catrom1d(x * m_scale); }
+    string_view name (void) const { return "catmull-rom"; }
 
     static float catrom1d (float x) {
         x = fabsf(x);
@@ -191,31 +234,28 @@ public:
                                       (3.0f * x3 - 5.0f * x2 + 2.0f) :
                                       (-x3 + 5.0f * x2 - 8.0f * x + 4.0f) );
     }
+private:
+    float m_scale;
 };
 
 
 
 class FilterCatmullRom2D : public Filter2D {
 public:
-    FilterCatmullRom2D (float width, float height) : Filter2D(4.0f,4.0f) { }
+    FilterCatmullRom2D (float width, float height)
+        : Filter2D(width,height), m_wscale(4.0f/width),
+          m_hscale(4.0f/height) { }
     ~FilterCatmullRom2D (void) { }
     float operator() (float x, float y) const {
-        return FilterCatmullRom1D::catrom1d(x)
-             * FilterCatmullRom1D::catrom1d(y);
+        return FilterCatmullRom1D::catrom1d(x * m_wscale)
+             * FilterCatmullRom1D::catrom1d(y * m_hscale);
     }
     bool separable (void) const { return true; }
-    float xfilt (float x) const { return FilterCatmullRom1D::catrom1d(x); }
-    float yfilt (float y) const { return FilterCatmullRom1D::catrom1d(y); }
-    const std::string name (void) const { return "catmull-rom"; }
-private :
-    static float catrom1d (float x) {
-        x = fabsf(x);
-        float x2 = x * x;
-        float x3 = x * x2;
-        return (x >= 2.0f) ? 0.0f :  ((x < 1.0f) ?
-                                      (3.0f * x3 - 5.0f * x2 + 2.0f) :
-                                      (-x3 + 5.0f * x2 - 8.0f * x + 4.0f) );
-    }
+    float xfilt (float x) const { return FilterCatmullRom1D::catrom1d(x * m_wscale); }
+    float yfilt (float y) const { return FilterCatmullRom1D::catrom1d(y * m_hscale); }
+    string_view name (void) const { return "catmull-rom"; }
+private:
+    float m_wscale, m_hscale;
 };
 
 
@@ -228,9 +268,9 @@ public:
     float operator() (float x) const {
         return bh1d (x * m_rad_inv);
     }
-    const std::string name (void) const { return "blackman-harris"; }
+    string_view name (void) const { return "blackman-harris"; }
     static float bh1d (float x) {
-	if (x < -1.0f || x > 1.0f)  // Early out if outside filter range
+        if (x < -1.0f || x > 1.0f)  // Early out if outside filter range
             return 0.0f;
         // Compute BH.  Straight from classic BH paper, but the usual
         // formula assumes that the filter is centered at 0.5, so scale:
@@ -240,8 +280,20 @@ public:
         const float A2 =  0.14128f;
         const float A3 = -0.01168f;
         const float m_pi = float (M_PI);
+#if 0
+        // original -- three cos calls!
         return A0 + A1 * cosf(2.f * m_pi * x) 
              + A2 * cosf(4.f * m_pi * x) + A3 * cosf(6.f * m_pi * x);
+#else
+        // Use trig identintities to reduce to just one cos.
+        // https://en.wikipedia.org/wiki/List_of_trigonometric_identities
+        // cos(2x) = 2 cos^2(x) - 1
+        // cos(3x) = 4 cos^3(x) − 3 cos(x)
+        float cos2pix = cosf(2.f * m_pi * x);
+        float cos4pix = 2.0f * cos2pix * cos2pix - 1.0f;
+        float cos6pix = cos2pix * (2.0f * cos4pix - 1.0f);
+        return A0 + A1 * cos2pix + A2 * cos4pix + A3 * cos6pix;
+#endif
     }
 private:
     float m_rad_inv;
@@ -262,7 +314,7 @@ public:
     bool separable (void) const { return true; }
     float xfilt (float x) const { return FilterBlackmanHarris1D::bh1d(x*m_wrad_inv); }
     float yfilt (float y) const { return FilterBlackmanHarris1D::bh1d(y*m_hrad_inv); }
-    const std::string name (void) const { return "blackman-harris"; }
+    string_view name (void) const { return "blackman-harris"; }
 private:
     float m_wrad_inv, m_hrad_inv;
 };
@@ -274,7 +326,7 @@ public:
     FilterSinc1D (float width) : Filter1D(width), m_rad(width/2.0f) { }
     ~FilterSinc1D (void) { }
     float operator() (float x) const { return sinc1d (x, m_rad); }
-    const std::string name (void) const { return "sinc"; }
+    string_view name (void) const { return "sinc"; }
 
     static float sinc1d (float x, float rad) {
         x = fabsf(x);
@@ -301,7 +353,7 @@ public:
     bool separable (void) const { return true; }
     float xfilt (float x) const { return FilterSinc1D::sinc1d(x,m_wrad); }
     float yfilt (float y) const { return FilterSinc1D::sinc1d(y,m_hrad); }
-    const std::string name (void) const { return "sinc"; }
+    string_view name (void) const { return "sinc"; }
 private:
     float m_wrad, m_hrad;
 };
@@ -310,69 +362,92 @@ private:
 
 class FilterLanczos3_1D : public Filter1D {
 public:
-    FilterLanczos3_1D (float /*width*/) : Filter1D(6.0f) { }
+    FilterLanczos3_1D (float width)
+        : Filter1D(width), m_scale(6.0f/width) { }
     ~FilterLanczos3_1D (void) { }
     float operator() (float x) const {
-        return lanczos3 (x);
+        return lanczos3 (x * m_scale);
     }
-    const std::string name (void) const { return "lanczos3"; }
+    string_view name (void) const { return "lanczos3"; }
 
     static float lanczos3 (float x) {
         const float a = 3.0f;  // Lanczos 3 lobe
+        const float ainv = 1.0f / a;
+        const float m_pi = float (M_PI);
         x = fabsf(x);
         if (x > a)
              return 0.0f;
         if (x < 0.0001f)
             return 1.0f;
-        const float m_pi = float (M_PI);
-        const float m_piinv = 1.0f / m_pi;
-        const float ainv = 1.0f/a;
+#if 0
+        // Full precision, for reference:
         float pix = m_pi * x;
-        return (a*m_piinv*m_piinv)/(x*x) * sinf(pix)*sinf(pix*ainv);
+        return a/(x*x*(m_pi*m_pi)) * sinf(pix)*sinf(pix*ainv);
+#elif 0
+        // Use approximate fast_sinphi -- about 0.1% absolute error, but
+        // around 2.5x times faster. BUT when graphed, looks very icky near
+        // f(0).
+        return a/(x*x*(m_pi*m_pi)) * fast_sinpi(x)*fast_sinpi(x*ainv);
+#else
+        // Compromise: full-precision sin(), but use the trig identity
+        //   sin(3x) = -4 sin^3(x) + 3 sin(x)
+        // to make it so only one call to sin is sufficient. This is still
+        // about 1.5x the speed of the reference implementation, but with
+        // no precision compromises.
+        float s1 = sinf(x*ainv*m_pi); // sin(x*pi/a)
+        float s3 = (-4.0f * s1*s1 + 3.0f) * s1; // sin(3*x*pi/a) == sin(x*pi)
+        return a/(x*x*(m_pi*m_pi)) * s1 * s3;
+#endif
     }
+private:
+    float m_scale;
 };
 
 
 
 class FilterLanczos3_2D : public Filter2D {
 public:
-    FilterLanczos3_2D (float /*width*/, float /*height*/)
-        : Filter2D(6.0f,6.0f)
-    { }
+    FilterLanczos3_2D (float width, float height)
+        : Filter2D(width,height), m_wscale(6.0f/width),
+          m_hscale(6.0f/height) { }
     ~FilterLanczos3_2D (void) { }
     float operator() (float x, float y) const {
-        return FilterLanczos3_1D::lanczos3(x) * FilterLanczos3_1D::lanczos3(y);
+        return FilterLanczos3_1D::lanczos3 (x * m_wscale)
+             * FilterLanczos3_1D::lanczos3 (y * m_hscale);
     }
     bool separable (void) const { return true; }
-    float xfilt (float x) const { return FilterLanczos3_1D::lanczos3(x); }
-    float yfilt (float y) const { return FilterLanczos3_1D::lanczos3(y); }
-    const std::string name (void) const { return "lanczos3"; }
+    float xfilt (float x) const { return FilterLanczos3_1D::lanczos3(x * m_wscale); }
+    float yfilt (float y) const { return FilterLanczos3_1D::lanczos3(y * m_hscale); }
+    string_view name (void) const { return "lanczos3"; }
+protected:
+    float m_wscale, m_hscale;
 };
 
 
 
 class FilterRadialLanczos3_2D : public FilterLanczos3_2D {
 public:
-    FilterRadialLanczos3_2D (float /*width*/, float /*height*/)
-        : FilterLanczos3_2D(6.0f,6.0f)
-    { }
+    FilterRadialLanczos3_2D (float width, float height)
+        : FilterLanczos3_2D(width,height) { }
     float operator() (float x, float y) const {
+        x *= m_wscale;
+        y *= m_hscale;
         return FilterLanczos3_1D::lanczos3(sqrtf(x*x + y*y));
     }
     bool separable (void) const { return false; }
-    const std::string name (void) const { return "radial-lanczos3"; }
+    string_view name (void) const { return "radial-lanczos3"; }
 };
 
 
 
 class FilterMitchell1D : public Filter1D {
 public:
-    FilterMitchell1D (float width) : Filter1D(width) { }
+    FilterMitchell1D (float width) : Filter1D(width), m_rad_inv(2.0f/width) { }
     ~FilterMitchell1D (void) { }
     float operator() (float x) const {
         return mitchell1d (x * m_rad_inv);
     }
-    const std::string name (void) const { return "mitchell"; }
+    string_view name (void) const { return "mitchell"; }
 
     static float mitchell1d (float x) {
         x = fabsf (x);
@@ -400,7 +475,7 @@ private:
 
 class FilterMitchell2D : public Filter2D {
 public:
-    FilterMitchell2D (float width, float height) 
+    FilterMitchell2D (float width, float height)
         : Filter2D(width,height),
           m_wrad_inv(2.0f/width), m_hrad_inv(2.0f/height) { }
     ~FilterMitchell2D (void) { }
@@ -415,7 +490,7 @@ public:
     float yfilt (float y) const {
         return FilterMitchell1D::mitchell1d (y * m_hrad_inv);
     }
-    const std::string name (void) const { return "mitchell"; }
+    string_view name (void) const { return "mitchell"; }
 private:
     float m_wrad_inv, m_hrad_inv;
 };
@@ -432,7 +507,7 @@ public:
     float operator() (float x) const {
         return bspline1d (x*m_wscale);
     }
-    const std::string name (void) const { return "b-spline"; }
+    string_view name (void) const { return "b-spline"; }
 
     static float bspline1d (float x) {
         x = fabsf (x);
@@ -469,7 +544,7 @@ public:
     float yfilt (float y) const {
         return FilterBSpline1D::bspline1d(y*m_hscale);
     }
-    const std::string name (void) const { return "b-spline"; }
+    string_view name (void) const { return "b-spline"; }
 private:
     float m_wscale, m_hscale;
 };
@@ -485,7 +560,115 @@ public:
         y /= (m_h*0.5f);
         return ((x*x+y*y) < 1.0f) ? 1.0f : 0.0f;
     }
-    const std::string name (void) const { return "disk"; }
+    string_view name (void) const { return "disk"; }
+};
+
+
+class FilterCubic1D : public Filter1D {
+public:
+    FilterCubic1D (float width)
+        : Filter1D(width), m_a(0.0f), m_rad_inv(2.0f / width)
+    { }
+    ~FilterCubic1D (void) { }
+    float operator() (float x) const {
+        return cubic(x * m_rad_inv, m_a);
+    }
+
+    static float cubic (float x, float a) {
+        x = fabsf (x);
+        if (x > 1.0f)
+            return 0.0f;
+        // Because range is -2 to 2, we rescale
+        x *= 2.0f;
+
+        if (x >= 1.0f)
+            return a * (x * (x * (x - 5.0f) + 8.0f) - 4.0f);
+            // return a * x*x*x - 5.0f * a * x*x + 8.0f * a * x - 4.0f * a;
+        else
+            return x*x*((a + 2.0f) * x - (a + 3.0f)) + 1.0f;
+            // return (a + 2.0f) * x*x*x - (a + 3.0f) * x*x + 1.0f;
+    }
+
+    virtual string_view name (void) const { return "cubic"; }
+protected:
+    float m_a;
+	float m_rad_inv;
+};
+
+
+
+class FilterCubic2D : public Filter2D {
+public:
+	FilterCubic2D (float width, float height)
+		: Filter2D(width,height), m_a(0.0f)
+		, m_wrad_inv(2.0f/width), m_hrad_inv(2.0f/height) { }
+    ~FilterCubic2D (void) { }
+    float operator() (float x, float y) const {
+        return FilterCubic1D::cubic(x * m_wrad_inv, m_a)
+             * FilterCubic1D::cubic(y * m_hrad_inv, m_a);
+    }
+    bool separable (void) const { return true; }
+    float xfilt (float x) const {
+        return FilterCubic1D::cubic (x * m_wrad_inv, m_a);
+    }
+    float yfilt (float y) const {
+        return FilterCubic1D::cubic (y * m_hrad_inv, m_a);
+    }
+    virtual string_view name (void) const { return "cubic"; }
+protected:
+    float m_a;
+    float m_wrad_inv, m_hrad_inv;
+};
+
+
+
+class FilterKeys1D : public FilterCubic1D {
+public:
+    FilterKeys1D (float width) : FilterCubic1D(width) { m_a = -0.5f; }
+    ~FilterKeys1D (void) { }
+    virtual string_view name (void) const { return "keys"; }
+};
+
+
+class FilterKeys2D : public FilterCubic2D {
+public:
+    FilterKeys2D (float width, float height) : FilterCubic2D(width,height) { m_a = -0.5f; }
+    ~FilterKeys2D (void) { }
+    virtual string_view name (void) const { return "keys"; }
+};
+
+
+
+class FilterSimon1D : public FilterCubic1D {
+public:
+    FilterSimon1D (float width) : FilterCubic1D(width) { m_a = -0.75f; }
+    ~FilterSimon1D (void) { }
+    virtual string_view name (void) const { return "simon"; }
+};
+
+
+class FilterSimon2D : public FilterCubic2D {
+public:
+    FilterSimon2D (float width, float height) : FilterCubic2D(width,height) { m_a = -0.75f; }
+    ~FilterSimon2D (void) { }
+    virtual string_view name (void) const { return "simon"; }
+};
+
+
+
+class FilterRifman1D : public FilterCubic1D {
+public:
+    FilterRifman1D (float width) : FilterCubic1D(width) { m_a = -1.0f; }
+    ~FilterRifman1D (void) { }
+    virtual string_view name (void) const { return "rifman"; }
+};
+
+
+class FilterRifman2D : public FilterCubic2D {
+public:
+    FilterRifman2D (float width, float height) : FilterCubic2D(width,height) { m_a = -1.0f; }
+    ~FilterRifman2D (void) { }
+    virtual string_view name (void) const { return "rifman"; }
 };
 
 
@@ -495,13 +678,18 @@ FilterDesc filter1d_list[] = {
     // name             dim width fixedwidth scalable separable
     { "box",             1,   1,    false,    true,     true },
     { "triangle",        1,   2,    false,    true,     true },
-    { "gaussian",        1,   2,    false,    true,     true },
-    { "catrom",          1,   4,    false,    false,    true },
+    { "gaussian",        1,   3,    false,    true,     true },
+    { "sharp-gaussian",  1,   2,    false,    true,     true },
+    { "catmull-rom",     1,   4,    false,    true,     true },
     { "blackman-harris", 1,   3,    false,    true,     true },
     { "sinc",            1,   4,    false,    true,     true },
-    { "lanczos3",        1,   6,    false,    false,    true },
-    { "mitchell",        1,   3,    false,    true,     true },
-    { "bspline",         1,   4,    false,    true,     true }
+    { "lanczos3",        1,   6,    false,    true,     true },
+    { "mitchell",        1,   4,    false,    true,     true },
+    { "bspline",         1,   4,    false,    true,     true },
+    { "cubic",           1,   4,    false,    true,     true },
+    { "keys",            1,   4,    false,    true,     true },
+    { "simon",           1,   4,    false,    true,     true },
+    { "rifman",          1,   4,    false,    true,     true }
 };
 }
 
@@ -525,7 +713,7 @@ Filter1D::get_filterdesc (int filternum, FilterDesc *filterdesc)
 // the correct implementation.  If the name is not recognized, return
 // NULL.
 Filter1D *
-Filter1D::create (const std::string &filtername, float width)
+Filter1D::create (string_view filtername, float width)
 {
     if (filtername == "box")
         return new FilterBox1D (width);
@@ -533,6 +721,8 @@ Filter1D::create (const std::string &filtername, float width)
         return new FilterTriangle1D (width);
     if (filtername == "gaussian")
         return new FilterGaussian1D (width);
+    if (filtername == "sharp-gaussian")
+        return new FilterSharpGaussian1D (width);
     if (filtername == "catmull-rom" || filtername == "catrom")
         return new FilterCatmullRom1D (width);
     if (filtername == "blackman-harris")
@@ -545,6 +735,14 @@ Filter1D::create (const std::string &filtername, float width)
         return new FilterMitchell1D (width);
     if (filtername == "b-spline" || filtername == "bspline")
         return new FilterBSpline1D (width);
+    if (filtername == "cubic")
+        return new FilterCubic1D (width);
+    if (filtername == "keys")
+        return new FilterKeys1D (width);
+    if (filtername == "simon")
+        return new FilterSimon1D (width);
+    if (filtername == "rifman")
+        return new FilterRifman1D (width);
     return NULL;
 }
 
@@ -562,15 +760,20 @@ static FilterDesc filter2d_list[] = {
     // name             dim width fixedwidth scalable separable
     { "box",             2,   1,    false,    true,     true  },
     { "triangle",        2,   2,    false,    true,     true  },
-    { "gaussian",        2,   2,    false,    true,     true  },
-    { "catrom",          2,   4,    true,     false,    true  },
+    { "gaussian",        2,   3,    false,    true,     true  },
+    { "sharp-gaussian",  2,   2,    false,    true,     true  },
+    { "catmull-rom",     2,   4,    false,    true,     true  },
     { "blackman-harris", 2,   3,    false,    true,     true  },
     { "sinc",            2,   4,    false,    true,     true  },
-    { "lanczos3",        2,   6,    true,     false,    true  },
-    { "radial-lanczos3", 2,   6,    true,     false,    false },
-    { "mitchell",        2,   3,    false,    true,     true  },
+    { "lanczos3",        2,   6,    false,    true,     true  },
+    { "radial-lanczos3", 2,   6,    false,    true,     false },
+    { "mitchell",        2,   4,    false,    true,     true  },
     { "bspline",         2,   4,    false,    true,     true  },
-    { "disk",            2,   1,    false,    true,     false }
+    { "disk",            2,   1,    false,    true,     false },
+    { "cubic",           2,   4,    false,    true,     true  },
+    { "keys",            2,   4,    false,    true,     true  },
+    { "simon",           2,   4,    false,    true,     true  },
+    { "rifman",          2,   4,    false,    true,     true  }
 };
 
 int
@@ -594,7 +797,7 @@ Filter2D::get_filterdesc (int filternum, FilterDesc *filterdesc)
 // NULL.
 
 Filter2D *
-Filter2D::create (const std::string &filtername, float width, float height)
+Filter2D::create (string_view filtername, float width, float height)
 {
     if (filtername == "box")
         return new FilterBox2D (width, height);
@@ -602,6 +805,8 @@ Filter2D::create (const std::string &filtername, float width, float height)
         return new FilterTriangle2D (width, height);
     if (filtername == "gaussian")
         return new FilterGaussian2D (width, height);
+    if (filtername == "sharp-gaussian")
+        return new FilterSharpGaussian2D (width, height);
     if (filtername == "catmull-rom" || filtername == "catrom")
         return new FilterCatmullRom2D (width, height);
     if (filtername == "blackman-harris")
@@ -618,6 +823,14 @@ Filter2D::create (const std::string &filtername, float width, float height)
         return new FilterBSpline2D (width, height);
     if (filtername == "disk")
         return new FilterDisk2D (width, height);
+    if (filtername == "cubic")
+        return new FilterCubic2D (width, height);
+    if (filtername == "keys")
+        return new FilterKeys2D (width, height);
+    if (filtername == "simon")
+        return new FilterSimon2D (width, height);
+    if (filtername == "rifman")
+        return new FilterRifman2D (width, height);
     return NULL;
 }
 
@@ -630,5 +843,4 @@ Filter2D::destroy (Filter2D *filt)
 }
 
 
-}
-OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END

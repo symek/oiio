@@ -28,12 +28,12 @@
   (This is the Modified BSD License)
 */
 
-#include "ptex/Ptexture.h"
+#include <Ptexture.h>
 
-#include "dassert.h"
-#include "typedesc.h"
-#include "imageio.h"
-#include "fmath.h"
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/typedesc.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/fmath.h"
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
 
@@ -43,6 +43,11 @@ public:
     PtexInput () : m_ptex(NULL) { init(); }
     virtual ~PtexInput () { close(); }
     virtual const char * format_name (void) const { return "ptex"; }
+    virtual int supports (string_view feature) const {
+        return (feature == "arbitrary_metadata"
+             || feature == "exif"   // Because of arbitrary_metadata
+             || feature == "iptc"); // Because of arbitrary_metadata
+    }
     virtual bool open (const std::string &name, ImageSpec &newspec);
     virtual bool close ();
     virtual int current_subimage (void) const { return m_subimage; }
@@ -83,6 +88,10 @@ OIIO_PLUGIN_EXPORTS_BEGIN
 OIIO_EXPORT ImageInput *ptex_input_imageio_create () { return new PtexInput; }
 
 OIIO_EXPORT int ptex_imageio_version = OIIO_PLUGIN_VERSION;
+
+OIIO_EXPORT const char* ptex_imageio_library_version () {
+    return ustring::format("Ptex %d.%d", PtexLibraryMajorVersion, PtexLibraryMinorVersion).c_str();
+}
 
 OIIO_EXPORT const char * ptex_input_extensions[] = {
     "ptex", "ptx", NULL

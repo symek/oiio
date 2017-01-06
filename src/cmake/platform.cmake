@@ -23,6 +23,11 @@ if (UNIX)
     elseif (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
         set (platform "FreeBSD")
         set (CXXFLAGS "${CXXFLAGS} -DFREEBSD")
+        if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i386")
+            # to use gcc atomics we need cpu instructions only available
+            # with arch of i586 or higher
+            set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=i586")
+        endif()
     else ()
         string (TOLOWER ${CMAKE_SYSTEM_NAME} platform)
     endif ()

@@ -40,6 +40,12 @@ The creation date of the image, in the following format: {\cf YYYY:MM:DD
   HH:MM:SS} (exactly 19 characters long, not including a terminating
 NULL).  For example, 7:30am on Dec
 31, 2008 is encoded as \qkw{2008:12:31 07:30:00}.
+
+Usually this is simply the time that the image data was last modified.
+It may be wise to also store the \qkw{Exif:DateTimeOriginal} and
+\qkw{Exif:DateTimeDigitized} (see Section~\ref{sec:metadata:exif})
+to further distinguish the original image and its conversion to digital
+media.
 \apiend
 
 \apiitem{"DocumentName" : string}
@@ -87,7 +93,7 @@ a different orientation, according to the TIFF/EXIF conventions:
 \begin{tabular}{p{0.3in} p{4in}}
 1 & normal (top to bottom, left to right)  \\
 2 & flipped horizontally (top to botom, right to left)  \\
-3 & rotate $180^\circ$ (bottom to top, right to left) \\
+3 & rotated $180^\circ$ (bottom to top, right to left) \\
 4 & flipped vertically (bottom to top, left to right)  \\
 5 & transposed (left to right, top to bottom) \\
 6 & rotated $90^\circ$ clockwise (right to left, top to bottom) \\
@@ -97,7 +103,7 @@ a different orientation, according to the TIFF/EXIF conventions:
 \apiend
 
 \apiitem{"PixelAspectRatio" : float}
-The aspect ratio ($x/y$) of the individual pixels, with square pixels
+The aspect ratio ($x/y$) of the size of individual pixels, with square pixels
 being 1.0 (the default).
 \apiend
 
@@ -112,6 +118,21 @@ eventually be printed).
 Different file formats may dictate different resolution units.
 For example, the TIFF ImageIO plugin supports \qkw{none}, \qkw{in}, 
 and \qkw{cm}.
+\apiend
+
+\apiitem{"ICCProfile" : uint8[]}
+The ICC color profile takes the form of an array of bytes (unsigned 8 bit
+chars). The length of the array is the length of the profile blob.
+\apiend
+
+\apiitem{"oiio:Movie" : int}
+If nonzero, a hint that a multi-image file is meant to be interpreted as
+an animation (i.e., that the subimages are a time sequence).
+\apiend
+
+\apiitem{"FramesPerSecond" : float}
+For a multi-image file intended to be played back as an animation,
+the frame refresh rate.
 \apiend
 
 \section{Disk file format info/hints}
@@ -241,6 +262,26 @@ row/column of pixels lie exactly at the $s$ or $t = 0$ or $1$
 boundaries, i.e., $s = i/(\mathit{xres}-1)$ and $t = j/(\mathit{yres}-1)$.
 \apiend
 
+\apiitem{"oiio:ConstantColor" : string}
+If present, is a hint that the texture has the same value in all pixels,
+and the metadata value is a string containing the channel values as
+a comma-separated list (no spaces, for example: \qkw{0.73,0.9,0.11,1.0}).
+\apiend
+
+\apiitem{"oiio:AverageColor" : string}
+If present, is a hint giving the \emph{average} value of all pixels in the
+texture, as a string containing a comma-separated list of the channel values
+(no spaces, for example: \qkw{0.73,0.9,0.11,1.0}).
+\apiend
+
+\apiitem{"oiio:SHA-1" : string}
+If present, is a 40-byte SHA-1 hash of the input image (possibly salted with
+various maketx options) that can serve to quickly compare two separate
+textures to know if they contain the same pixels. While it's not, technically,
+100\% guaranteed that no separate textures will match, it's so astronomically
+unlikely that we discount the possibility (you'd be rendering movies for
+centuries before finding a single match).
+\apiend
 
 \section{Exif metadata}
 \label{sec:metadata:exif}
@@ -274,7 +315,7 @@ purposes.
 
 \apiitem{"Exif:ExposureProgram" : int}
 The exposure program used to set exposure when the picture was taken:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & unknown \\
@@ -300,14 +341,17 @@ The ISO speed and ISO latitude of the camera as specified in ISO 12232.
 %\apiitem{"Exif:OECF",	TIFF_NOTYPE }	 // skip it
 %\apiitem{"Exif:ExifVersion",	TIFF_NOTYPE }	 // skip it
 
-\apiitem{"Exif:DateTimeOriginal" : string}
-Date and time that the original image data was generated (in
-\qkw{YYYY:MM:DD HH:MM:SS} format).
-\apiend
+\apiitem{"Exif:DateTimeOriginal" : string \\
+"Exif:DateTimeDigitized" : string}
+Date and time that the original image data was generated or captured,
+and the time/time that the image was stored as digital data. Both are in
+\qkw{YYYY:MM:DD HH:MM:SS} format.
 
-\apiitem{"Exif:DateTimeDigitized" : string}
-Date and time that the image was stored as digital data (in
-\qkw{YYYY:MM:DD HH:MM:SS} format).
+To clarify the role of these (and also with respect to the standard
+\qkw{DateTime} metadata), consider an analog photograph taken in 1960
+({\cf Exif:DateTimeOriginal}), which was scanned to a digital image in 2010
+({\cf Exif:DateTimeDigitized}), and had color corrections or other
+alterations performed in 2015 ({\cf DateTime}).
 \apiend
 
 %\apiitem{"Exif:ComponentsConfiguration",TIFF_UNDEFINED }
@@ -342,7 +386,7 @@ Distance to the subject, in meters.
 \apiitem{"Exif:MeteringMode" : int}
 The metering mode:
 
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & unknown \\
@@ -359,7 +403,7 @@ The metering mode:
 \apiitem{"Exif:LightSource" : int}
 The kind of light source:
 
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & unknown \\
@@ -411,6 +455,17 @@ A sum of:
 Actual focal length of the lens, in mm.
 \apiend
 
+\apiitem{"Exif:SecurityClassification" : string}
+Security classification of the image: `C' = confidential,
+`R' = restricted, `S' = secret, `T' = top secret,
+`U' = unclassified.
+\apiend
+
+\apiitem{"Exif:ImageHistory" : string}
+Image history.
+\apiend
+
+
 %\apiitem{"Exif:SubjectArea",TIFF_NOTYPE } // skip
 %\apiitem{"Exif:MakerNote",TIFF_NOTYPE } // skip it
 %\apiitem{"Exif:UserComment",TIFF_NOTYPE }// skip it
@@ -451,8 +506,16 @@ Seconds (BCPS).
 "Exif:FocalPlaneYResolution" : float \\
 "Exif:FocalPlaneResolutionUnit" : int} 
 The number of pixels in the $x$ and $y$ dimension, per resolution unit.
-The code for resolution units is: 2 for inches.
-% FIXME? units?
+The codes for resolution units are:
+\smallskip
+
+\begin{tabular}{p{0.3in} p{4in}}
+1 & none \\
+2 & inches \\
+3 & cm \\
+4 & mm \\
+5 & $\mu$m \\
+\end{tabular}
 \apiend
 
 
@@ -464,7 +527,7 @@ The exposure index selected on the camera.
 
 \apiitem{"Exif:SensingMethod" : int}
 The image sensor type on the camra:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 1 & undefined \\
@@ -478,8 +541,14 @@ The image sensor type on the camra:
 \apiend
 
 \apiitem{"Exif:FileSource" : int}
-Set to 3, if captured by a digital camera, otherwise it should not be
-present.
+The source type of the scanned image, if known:
+\smallskip
+
+\begin{tabular}{p{0.3in} p{4in}}
+1 & film scanner \\
+2 & reflection print scanner \\
+3 & digital camera \\
+\end{tabular}
 \apiend
 
 \apiitem{"Exif:SceneType" : int}
@@ -496,7 +565,7 @@ performed on the image data.
 
 \apiitem{"Exif:ExposureMode" : int}
 The exposure mode:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & auto \\
@@ -519,7 +588,7 @@ The equivalent focal length of a 35mm camera, in mm.
 
 \apiitem{"Exif:SceneCaptureType" : int}
 The type of scene that was shot:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & standard \\
@@ -531,7 +600,7 @@ The type of scene that was shot:
 
 \apiitem{"Exif:GainControl" : float }
 The degree of overall gain adjustment:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & none \\
@@ -544,7 +613,7 @@ The degree of overall gain adjustment:
 
 \apiitem{"Exif:Contrast" : int}
 The direction of contrast processing applied by the camera:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & normal \\
@@ -555,7 +624,7 @@ The direction of contrast processing applied by the camera:
 
 \apiitem{"Exif:Saturation" : int}
 The direction of saturation processing applied by the camera:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & normal \\
@@ -566,7 +635,7 @@ The direction of saturation processing applied by the camera:
 
 \apiitem{"Exif:Sharpness" : int}
 The direction of sharpness processing applied by the camera:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & normal \\
@@ -579,7 +648,7 @@ The direction of sharpness processing applied by the camera:
 
 \apiitem{"Exif:SubjectDistanceRange" : int}
 The distance to the subject:
-\medskip
+\smallskip
 
 \begin{tabular}{p{0.3in} p{4in}}
 0 & unknown \\
@@ -744,6 +813,10 @@ Date according to the GPS device, in format \qkw{YYYY:MM:DD}.
 If 1, indicates that differential correction was applied.
 \apiend
 
+\apiitem{"GPS:HPositioningError" : float}
+Positioning error.
+\apiend
+
 
 
 \section{IPTC metadata}
@@ -772,37 +845,99 @@ CopyrightNotice & \qkw{Copyright} \\[0.5ex]
 Creator & \qkw{Artist} \\
 \end{tabular}
 
-\medskip
+\bigskip
 
 The remainder of IPTC metadata fields should use the following names,
 prefixed with ``IPTC:'' to avoid conflicts with other plugins or
 standards.
 
+\apiitem{"IPTC:ObjecTypeReference" : string}
+Object type reference.
+\apiend
+
+\apiitem{"IPTC:ObjectAttributeReference" : string}
+Object attribute reference.
+\apiend
+
 \apiitem{"IPTC:ObjectName" : string}
 The name of the object in the picture.
+\apiend
+
+\apiitem{"IPTC:EditStatus" : string}
+Edit status.
+\apiend
+
+\apiitem{"IPTC:SubjectReference" : string}
+Subject reference.
+\apiend
+
+\apiitem{"IPTC:Category" : string}
+Category.
 \apiend
 
 % \apiitem{  25, "Keywords" : string}
 %\apiend
 % FIXME
 
+\apiitem{"IPTC:ContentLocationCode" : string}
+Code for content location.
+\apiend
+
+\apiitem{"IPTC:ContentLocationName" : string}
+Name of content location.
+\apiend
+
+\apiitem{"IPTC:ReleaseDate" : string \\
+"IPTC:ReleaseTime" : string}
+Release date and time.
+\apiend
+
+\apiitem{"IPTC:ExpirationDate" : string \\
+"IPTC:ExpirationTime" : string}
+Expiration date and time.
+\apiend
+
 \apiitem{"IPTC:Instructions" : string}
 Special instructions for handling the image.
 \apiend
+
+\apiitem{"IPTC:ReferenceService" : string \\
+"IPTC:ReferenceDate" : string \\
+"IPTC:ReferenceNumber" : string}
+Reference date, service, and number.
+\apiend
+
+\apiitem{"IPTC:DateCreated" : string \\
+"IPTC:TimeCreated" : string}
+Date and time that the image was created.
+\apiend
+
+\apiitem{"IPTC:DigitalCreationDate" : string \\
+"IPTC:DigitalCreationTime" : string}
+Date and time that the image was digitized.
+\apiend
+
 
 %\apiitem{"IPTC:Creator" : string}
 %The creator of the image.  This is optinal and, If present, 
 %is expected to be the same as the data in the standard \qkw{Artist} field.
 %\apiend
 
+\apiitem{"IPTC:ProgramVersion" : string}
+The version number of the creation software.
+\apiend
+
 \apiitem{"IPTC:AuthorsPosition" : string}
 The job title or position of the creator of the image.
 \apiend
 
 \apiitem{"IPTC:City" : string \\
+"IPTC:Sublocation" : string \\
 "IPTC:State" : string \\
-"IPTC:Country" : string}
-The city, state, and country of the location of the image.
+"IPTC:Country" : string \\
+"IPTC:CountryCode" : string}
+The city, sublocation within the city,
+state, country, and country code of the location of the image.
 \apiend
 
 \apiitem{"IPTC:Headline" : string}
@@ -836,6 +971,45 @@ email, etc.).
 \apiitem{"IPTC:CaptionWriter" : string}
 The name of the person who wrote the caption or description of the image.
 \apiend
+
+\apiitem{"IPTC:JobID" : string \\
+"IPTC:MasterDocumentID" : string \\
+"IPTC:ShortDocumentID" : string \\
+"IPTC:UniqueDocumentID" : string \\
+"IPTC:OwnerID" : string }
+Various identification tags.
+\apiend
+
+\apiitem{"IPTC:Prefs" : string \\
+"IPTC:ClassifyState" : string \\
+"IPTC:SimilarityIndex" : string}
+Who knows what the heck these are?
+\apiend
+
+\apiitem{"IPTC:DocumentNotes" : string}
+Notes about the image or document.
+\apiend
+
+\apiitem{"IPTC:DocumentHistory" : string}
+The history of the image or document.
+\apiend
+
+
+\section{SMPTE metadata}
+\label{sec:metadata:smpte}
+\index{SMPTE metadata}
+
+\apiitem{"smpte:TimeCode" : int[2]}
+SMPTE time code, encoded as an array of 2 32-bit integers (as a
+\TypeDesc, it will be tagged with vecsemantics {\cf TIMECODE}).
+\apiend
+
+\apiitem{"smpte:KeyCode" : int[7]}
+SMPTE key code, encoded as an array of 7 32-bit integers (as a
+\TypeDesc, it will be tagged with vecsemantics {\cf KEYCODE}).
+\apiend
+
+
 
 
 \section{Extension conventions}

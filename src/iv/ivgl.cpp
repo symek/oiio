@@ -33,36 +33,40 @@
 
 #include <iostream>
 
-// This needs to be included before GL.h
-// (which is included by QtOpenGL and QGLFormat)
-#include <glew.h>
-
 #include <OpenEXR/half.h>
 #include <OpenEXR/ImathFun.h>
 
-#include <QtGui/QComboBox>
-#include <QtGui/QLabel>
-#include <QtGui/QMouseEvent>
-#include <QtGui/QProgressBar>
-#include <QtOpenGL/QGLFormat>
-
-#include <boost/algorithm/string.hpp>
-using boost::algorithm::iequals;
-#include <boost/foreach.hpp>
-#include <boost/algorithm/string/split.hpp>
-#include <boost/algorithm/string/classification.hpp>
-#include <boost/algorithm/string/compare.hpp>
+#include <QComboBox>
+#include <QLabel>
+#include <QMouseEvent>
+#include <QProgressBar>
+#include <QGLFormat>
 
 #include "ivutils.h"
-#include "strutil.h"
-#include "fmath.h"
-#include "timer.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/fmath.h"
+#include "OpenImageIO/timer.h"
 
+
+static const char *
+gl_err_to_string (GLenum err)
+{  // Thanks, Dan Wexler, for this function
+    switch (err) {
+    case GL_NO_ERROR: return "No error";
+    case GL_INVALID_ENUM: return "Invalid enum";
+    case GL_INVALID_OPERATION: return "Invalid operation";
+    case GL_INVALID_VALUE: return "Invalid value";
+    case GL_OUT_OF_MEMORY: return "Out of memory";
+    case GL_INVALID_FRAMEBUFFER_OPERATION:
+        return "Invalid framebuffer operation";
+    default: return "Unknown";
+    }
+}
 
 
 #define GLERRPRINT(msg)                                           \
     for (GLenum err = glGetError();  err != GL_NO_ERROR;  err = glGetError()) \
-        std::cerr << "GL error " << msg << " " << (int)err <<  " - " << (const char *)gluErrorString(err) << "\n";      \
+        std::cerr << "GL error " << msg << " " << (int)err <<  " - " << gl_err_to_string(err) << "\n";      \
 
 
 
@@ -573,7 +577,7 @@ handle_orientation (int orientation, int width, int height,
 void
 IvGL::paintGL ()
 {
-#ifdef DEBUG
+#ifndef NDEBUG
     Timer paint_image_time;
     paint_image_time.start();
 #endif
@@ -675,7 +679,7 @@ IvGL::paintGL ()
     m_viewer.statusViewInfo->show ();
     unsetCursor ();
 
-#ifdef DEBUG
+#ifndef NDEBUG
     std::cerr << "paintGL elapsed time: " << paint_image_time() << " seconds\n";
 #endif
 }
@@ -812,14 +816,15 @@ IvGL::paint_pixelview ()
 
         void *zoombuffer = alloca ((xend-xbegin)*(yend-ybegin)*nchannels*spec.channel_bytes());
         if (! m_use_shaders) {
-            img->get_pixels (spec.x + xbegin, spec.x + xend,
-                             spec.y + ybegin, spec.y + yend,
+            img->get_pixels (ROI (spec.x + xbegin, spec.x + xend,
+                                  spec.y + ybegin, spec.y + yend),
                              spec.format, zoombuffer);
         } else {
-            img->get_pixel_channels (spec.x + xbegin, spec.x + xend,
-                    spec.y + ybegin, spec.y + yend, 0, 1,
-                    m_viewer.current_channel(), m_viewer.current_channel()+nchannels,
-                    spec.format, zoombuffer);
+            ROI roi (spec.x + xbegin, spec.x + xend,
+                     spec.y + ybegin, spec.y + yend,
+                     0, 1,
+                     m_viewer.current_channel(), m_viewer.current_channel()+nchannels);
+            img->get_pixels (roi, spec.format, zoombuffer);
         }
 
         GLenum glformat, gltype, glinternalformat;
@@ -875,7 +880,7 @@ IvGL::paint_pixelview ()
     gl_rect (-0.5f*closeupsize-2, 0.5f*closeupsize+2,
              0.5f*closeupsize+2, -0.5f*closeupsize - extraspace, -0.1f);
 
-    if (xp >= 0 && xp < img->oriented_width() && yp >= 0 && yp < img->oriented_height()) {
+    if (1 /*xp >= 0 && xp < img->oriented_width() && yp >= 0 && yp < img->oriented_height()*/) {
         // Now we print text giving the mouse coordinates and the numerical
         // values of the pixel that the mouse is over.
         QFont font;
@@ -927,7 +932,7 @@ IvGL::useshader (int tex_width, int tex_height, bool pixelview)
 
     if (!m_use_shaders) {
         glTexEnvf (GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-        BOOST_FOREACH (TexBuffer &tb, m_texbufs) {
+        for (auto&& tb : m_texbufs) {
             glBindTexture (GL_TEXTURE_2D, tb.tex_object);
             if (m_viewer.linearInterpolation ()) {
                 glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1026,7 +1031,7 @@ IvGL::update ()
         glBindBufferARB (GL_PIXEL_UNPACK_BUFFER_ARB, 0);
     }
 
-    BOOST_FOREACH (TexBuffer &tb, m_texbufs) {
+    for (auto&& tb : m_texbufs) {
         tb.width = 0;
         tb.height= 0;
         glBindTexture (GL_TEXTURE_2D, tb.tex_object);
@@ -1421,7 +1426,7 @@ IvGL::check_gl_extensions (void)
     // resources to use more than one of those at the same time.
     m_max_texture_size = std::min(m_max_texture_size, 4096);
 
-#ifdef DEBUG
+#ifndef NDEBUG
     // Report back...
     std::cerr << "OpenGL Shading Language supported: " << m_use_shaders << "\n";
     if (m_shaders_using_extensions) {
@@ -1466,7 +1471,7 @@ IvGL::typespec_to_opengl (const ImageSpec &spec, int nchannels, GLenum &gltype, 
         break;
     }
 
-    bool issrgb = iequals (spec.get_string_attribute ("oiio:ColorSpace"), "sRGB");
+    bool issrgb = Strutil::iequals (spec.get_string_attribute ("oiio:ColorSpace"), "sRGB");
     
     glinternalformat = nchannels;
     if (nchannels == 1) {
@@ -1550,7 +1555,7 @@ IvGL::load_texture (int x, int y, int width, int height, float percent)
 {
     const ImageSpec &spec = m_current_image->spec ();
     // Find if this has already been loaded.
-    BOOST_FOREACH (TexBuffer &tb, m_texbufs) {
+    for (auto&& tb : m_texbufs) {
         if (tb.x == x && tb.y == y && tb.width >= width && tb.height >= height) {
             glBindTexture (GL_TEXTURE_2D, tb.tex_object);
             return;
@@ -1583,13 +1588,13 @@ IvGL::load_texture (int x, int y, int width, int height, float percent)
     // it safely since ImageBuf has a cache underneath and the whole image
     // may not be resident at once.
     if (! m_use_shaders) {
-        m_current_image->get_pixels (x, x + width, y, y + height,
+        m_current_image->get_pixels (ROI (x, x + width, y, y + height),
                                      spec.format, &m_tex_buffer[0]);
     } else {
-        m_current_image->get_pixel_channels (x, x+width, y, y+height, 0, 1,
-                                             m_viewer.current_channel(),
-                                             m_viewer.current_channel() + nchannels,
-                                             spec.format, &m_tex_buffer[0]);
+        m_current_image->get_pixels (ROI (x, x+width, y, y+height, 0, 1,
+                                          m_viewer.current_channel(),
+                                          m_viewer.current_channel() + nchannels),
+                                     spec.format, &m_tex_buffer[0]);
     }
     if (m_use_pbo) {
         glBindBufferARB (GL_PIXEL_UNPACK_BUFFER_ARB, 

@@ -40,14 +40,12 @@
 #include <string>
 #include <sstream>
 
-#include "strutil.h"
-#include "sysutil.h"
-#include "argparse.h"
-#include "dassert.h"
-#include "filesystem.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/sysutil.h"
+#include "OpenImageIO/argparse.h"
+#include "OpenImageIO/dassert.h"
 
-OIIO_NAMESPACE_ENTER
-{
+OIIO_NAMESPACE_BEGIN
 
 class ArgOption {
 public:
@@ -88,6 +86,7 @@ public:
     void description (const char *d) { m_descript = d; }
     const std::string & description() const { return m_descript; }
 
+    bool is_separator () const { return fmt() == "<SEPARATOR>"; }
 private:
     enum OptionType { None, Regular, Flag, ReverseFlag, Sublist };
 
@@ -131,7 +130,7 @@ ArgOption::initialize()
         m_count = 1;                      // sublist callback function pointer
         m_code = "*";
         m_flag = "";
-    } else if (m_format == "<SEPARATOR>") {
+    } else if (is_separator()) {
     } else {
         // extract the flag name
         s = &m_format[0];
@@ -322,7 +321,6 @@ ArgOption::add_argument (const char *argv)
 ArgParse::ArgParse (int argc, const char **argv)
     : m_argc(argc), m_argv(argv), m_global(NULL)
 {
-    Filesystem::convert_native_arguments (m_argc, m_argv);
 }
 
 
@@ -349,8 +347,6 @@ ArgParse::parse (int xargc, const char **xargv)
 {
     m_argc = xargc;
     m_argv = xargv;
-
-    Filesystem::convert_native_arguments (m_argc, m_argv);
 
     for (int i = 1; i < m_argc; i++) {
         if (m_argv[i][0] == '-' && 
@@ -524,7 +520,7 @@ ArgParse::usage () const
         ArgOption *opt = m_option[i];
         if (opt->description().length()) {
             size_t fmtlen = opt->fmt().length();
-            if (opt->fmt() == "<SEPARATOR>") {
+            if (opt->is_separator()) {
                 std::cout << Strutil::wordwrap(opt->description(), columns-2, 0) << '\n';
             } else {
                 std::cout << "    " << opt->fmt();
@@ -532,10 +528,37 @@ ArgParse::usage () const
                     std::cout << std::string (maxlen + 2 - fmtlen, ' ');
                 else
                     std::cout << "\n    " << std::string (maxlen + 2, ' ');
-                std::cout << Strutil::wordwrap(opt->description(), columns-2, maxlen+2+4+2) << '\n';
+                std::cout << Strutil::wordwrap(opt->description(), columns-2, (int)maxlen+2+4+2) << '\n';
             }
         }
     }
+}
+
+
+
+void
+ArgParse::briefusage () const
+{
+    std::cout << m_intro << '\n';
+    // Try to figure out how wide the terminal is, so we can word wrap.
+    int columns = Sysutil::terminal_columns ();
+
+    std::string pending;
+    for (unsigned int i=0; i<m_option.size(); ++i) {
+        ArgOption *opt = m_option[i];
+        if (opt->description().length()) {
+            if (opt->is_separator()) {
+                if (pending.size())
+                    std::cout << "    " << Strutil::wordwrap(pending, columns-2, 4) << '\n';
+                pending.clear ();
+                std::cout << Strutil::wordwrap(opt->description(), columns-2, 0) << '\n';
+            } else {
+                pending += opt->name() + " ";
+            }
+        }
+    }
+    if (pending.size())
+        std::cout << "    " << Strutil::wordwrap(pending, columns-2, 4) << '\n';
 }
 
 
@@ -560,5 +583,4 @@ ArgParse::command_line () const
 
 
 
-}
-OIIO_NAMESPACE_EXIT
+OIIO_NAMESPACE_END

@@ -34,15 +34,25 @@
 #include <cmath>
 #include <ctime>
 #include <iostream>
+#include <memory>
 
 #include <tiffio.h>
 
-#include "dassert.h"
-#include "imageio.h"
-#include "filesystem.h"
-#include "strutil.h"
-#include "sysutil.h"
-#include "timer.h"
+// Some EXIF tags that don't seem to be in tiff.h
+#ifndef EXIFTAG_SECURITYCLASSIFICATION
+#define EXIFTAG_SECURITYCLASSIFICATION 37394
+#endif
+#ifndef EXIFTAG_IMAGEHISTORY
+#define EXIFTAG_IMAGEHISTORY 37395
+#endif
+
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/strutil.h"
+#include "OpenImageIO/sysutil.h"
+#include "OpenImageIO/timer.h"
+#include "OpenImageIO/fmath.h"
 
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
@@ -55,7 +65,7 @@ namespace
     // re-writes the tiff header and any new tiles / scanlines)
     
     static double DEFAULT_CHECKPOINT_INTERVAL_SECONDS = 5.0;
-    static int MIN_SCANLINES_OR_TILES_PER_CHECKPOINT = 16;
+    static int MIN_SCANLINES_OR_TILES_PER_CHECKPOINT = 64;
 }
 
 class TIFFOutput : public ImageOutput {
@@ -63,7 +73,7 @@ public:
     TIFFOutput ();
     virtual ~TIFFOutput ();
     virtual const char * format_name (void) const { return "tiff"; }
-    virtual bool supports (const std::string &feature) const;
+    virtual int supports (string_view feature) const;
     virtual bool open (const std::string &name, const ImageSpec &spec,
                        OpenMode mode=Create);
     virtual bool close ();
@@ -76,22 +86,34 @@ public:
 private:
     TIFF *m_tif;
     std::vector<unsigned char> m_scratch;
-    int m_planarconfig;
     Timer m_checkpointTimer;
     int m_checkpointItems;
+    unsigned int m_dither;
+    // The following fields are describing what we are writing to the file,
+    // not what's in the client's view of the buffer.
+    int m_planarconfig;
+    int m_compression;
+    int m_photometric;
+    unsigned int m_bitspersample;  ///< Of the *file*, not the client's view
+    int m_outputchans;   // Number of channels for the output
 
     // Initialize private members to pre-opened state
     void init (void) {
         m_tif = NULL;
         m_checkpointItems = 0;
+        m_compression = COMPRESSION_ADOBE_DEFLATE;
+        m_photometric = PHOTOMETRIC_RGB;
+        m_outputchans = 0;
     }
 
     // Convert planar contiguous to planar separate data format
-    void contig_to_separate (int n, const unsigned char *contig,
-                             unsigned char *separate);
+    void contig_to_separate (int n, const char *contig, char *separate);
+    // Convert RGB to CMYK
+    void* convert_to_cmyk (int npixels, const void* data);
     // Add a parameter to the output
     bool put_parameter (const std::string &name, TypeDesc type,
                         const void *data);
+    bool write_exif_data ();
 };
 
 
@@ -104,6 +126,12 @@ OIIO_EXPORT ImageOutput *tiff_output_imageio_create () { return new TIFFOutput; 
 
 OIIO_EXPORT int tiff_imageio_version = OIIO_PLUGIN_VERSION;
 
+OIIO_EXPORT const char* tiff_imageio_library_version () {
+    string_view v (TIFFGetVersion());
+    v = v.substr (0, v.find ('\n'));
+    return v.c_str();
+}
+
 OIIO_EXPORT const char * tiff_output_extensions[] = {
     "tiff", "tif", "tx", "env", "sm", "vsm", NULL
 };
@@ -112,8 +140,69 @@ OIIO_PLUGIN_EXPORTS_END
 
 
 
+extern std::string & oiio_tiff_last_error ();
+extern void oiio_tiff_set_error_handler ();
+
+
+
+
+struct CompressionCode {
+    int code;
+    const char *name;
+};
+
+// We comment out a lot of these because we only support a subset for
+// writing. These can be uncommented on a case by case basis as they are
+// thoroughly tested and included in the testsuite.
+static CompressionCode tiff_compressions[] = {
+    { COMPRESSION_NONE,          "none" },        // no compression
+    { COMPRESSION_LZW,           "lzw" },         // LZW
+    { COMPRESSION_ADOBE_DEFLATE, "zip" },         // deflate / zip
+    { COMPRESSION_DEFLATE,       "zip" },         // deflate / zip
+    { COMPRESSION_CCITTRLE,      "ccittrle" },    // CCITT RLE
+//  { COMPRESSION_CCITTFAX3,     "ccittfax3" },   // CCITT group 3 fax
+//  { COMPRESSION_CCITT_T4,      "ccitt_t4" },    // CCITT T.4
+//  { COMPRESSION_CCITTFAX4,     "ccittfax4" },   // CCITT group 4 fax
+//  { COMPRESSION_CCITT_T6,      "ccitt_t6" },    // CCITT T.6
+//  { COMPRESSION_OJPEG,         "ojpeg" },       // old (pre-TIFF6.0) JPEG
+    { COMPRESSION_JPEG,          "jpeg" },        // JPEG
+//  { COMPRESSION_NEXT,          "next" },        // NeXT 2-bit RLE
+//  { COMPRESSION_CCITTRLEW,     "ccittrle2" },   // #1 w/ word alignment
+    { COMPRESSION_PACKBITS,      "packbits" },    // Macintosh RLE
+//  { COMPRESSION_THUNDERSCAN,   "thunderscan" }, // ThundeScan RLE
+//  { COMPRESSION_IT8CTPAD,      "IT8CTPAD" },    // IT8 CT w/ patting
+//  { COMPRESSION_IT8LW,         "IT8LW" },       // IT8 linework RLE
+//  { COMPRESSION_IT8MP,         "IT8MP" },       // IT8 monochrome picture
+//  { COMPRESSION_IT8BL,         "IT8BL" },       // IT8 binary line art
+//  { COMPRESSION_PIXARFILM,     "pixarfilm" },   // Pixar 10 bit LZW
+//  { COMPRESSION_PIXARLOG,      "pixarlog" },    // Pixar 11 bit ZIP
+//  { COMPRESSION_DCS,           "dcs" },         // Kodak DCS encoding
+//  { COMPRESSION_JBIG,          "isojbig" },     // ISO JBIG
+//  { COMPRESSION_SGILOG,        "sgilog" },      // SGI log luminance RLE
+//  { COMPRESSION_SGILOG24,      "sgilog24" },    // SGI log 24bit
+//  { COMPRESSION_JP2000,        "jp2000" },      // Leadtools JPEG2000
+#if defined(TIFF_VERSION_BIG) && TIFFLIB_VERSION >= 20120922
+    // Others supported in more recent TIFF library versions.
+//  { COMPRESSION_T85,           "T85" },         // TIFF/FX T.85 JBIG
+//  { COMPRESSION_T43,           "T43" },         // TIFF/FX T.43 color layered JBIG
+//  { COMPRESSION_LZMA,          "lzma" },        // LZMA2
+#endif
+    { -1, NULL }
+};
+
+static int tiff_compression_code (string_view name)
+{
+    for (int i = 0; tiff_compressions[i].name; ++i)
+        if (Strutil::iequals (name, tiff_compressions[i].name))
+            return tiff_compressions[i].code;
+    return COMPRESSION_ADOBE_DEFLATE;  // default
+}
+
+
+
 TIFFOutput::TIFFOutput ()
 {
+    oiio_tiff_set_error_handler ();
     init ();
 }
 
@@ -127,8 +216,8 @@ TIFFOutput::~TIFFOutput ()
 
 
 
-bool
-TIFFOutput::supports (const std::string &feature) const
+int
+TIFFOutput::supports (string_view feature) const
 {
     if (feature == "tiles")
         return true;
@@ -136,11 +225,20 @@ TIFFOutput::supports (const std::string &feature) const
         return true;
     if (feature == "appendsubimage")
         return true;
+    if (feature == "alpha")
+        return true;
+    if (feature == "nchannels")
+        return true;
     if (feature == "displaywindow")
         return true;
     if (feature == "origin")
         return true;
     // N.B. TIFF doesn't support "negativeorigin"
+    if (feature == "exif")
+        return true;
+    if (feature == "iptc")
+        return true;
+    // N.B. TIFF doesn't support arbitrary metadata.
 
     // FIXME: we could support "volumes" and "empty"
 
@@ -148,6 +246,8 @@ TIFFOutput::supports (const std::string &feature) const
     return false;
 }
 
+
+#define ICC_PROFILE_ATTR "ICCProfile"
 
 
 bool
@@ -168,6 +268,14 @@ TIFFOutput::open (const std::string &name, const ImageSpec &userspec,
                m_spec.width, m_spec.height);
         return false;
     }
+    if (m_spec.tile_width) {
+       if (m_spec.tile_width  % 16 != 0 ||
+           m_spec.tile_height % 16 != 0 ||
+           m_spec.tile_height == 0) {
+          error("Tile size must be a multiple of 16, you asked for %d x %d", m_spec.tile_width, m_spec.tile_height);
+          return false;
+       }
+    }
     if (m_spec.depth < 1)
         m_spec.depth = 1;
 
@@ -183,15 +291,24 @@ TIFFOutput::open (const std::string &name, const ImageSpec &userspec,
         return false;
     }
 
-    TIFFSetField (m_tif, TIFFTAG_XPOSITION, (float)m_spec.x);
-    TIFFSetField (m_tif, TIFFTAG_YPOSITION, (float)m_spec.y);
+    // N.B. Clamp position at 0... TIFF is internally incapable of having
+    // negative origin.
+    TIFFSetField (m_tif, TIFFTAG_XPOSITION, (float)std::max (0, m_spec.x));
+    TIFFSetField (m_tif, TIFFTAG_YPOSITION, (float)std::max (0, m_spec.y));
+
     TIFFSetField (m_tif, TIFFTAG_IMAGEWIDTH, m_spec.width);
     TIFFSetField (m_tif, TIFFTAG_IMAGELENGTH, m_spec.height);
+
+    // Handle display window or "full" size. Note that TIFF can't represent
+    // nonzero offsets of the full size, so we may need to expand the
+    // display window to encompass the origin.
     if ((m_spec.full_width != 0 || m_spec.full_height != 0) &&
-        (m_spec.full_width != m_spec.width || m_spec.full_height != m_spec.height)) {
-        TIFFSetField (m_tif, TIFFTAG_PIXAR_IMAGEFULLWIDTH, m_spec.full_width);
-        TIFFSetField (m_tif, TIFFTAG_PIXAR_IMAGEFULLLENGTH, m_spec.full_height);
+        (m_spec.full_width != m_spec.width || m_spec.full_height != m_spec.height ||
+         m_spec.full_x != 0 || m_spec.full_y != 0)) {
+        TIFFSetField (m_tif, TIFFTAG_PIXAR_IMAGEFULLWIDTH, m_spec.full_width+m_spec.full_x);
+        TIFFSetField (m_tif, TIFFTAG_PIXAR_IMAGEFULLLENGTH, m_spec.full_height+m_spec.full_y);
     }
+
     if (m_spec.tile_width) {
         TIFFSetField (m_tif, TIFFTAG_TILEWIDTH, m_spec.tile_width);
         TIFFSetField (m_tif, TIFFTAG_TILELENGTH, m_spec.tile_height);
@@ -200,51 +317,138 @@ TIFFOutput::open (const std::string &name, const ImageSpec &userspec,
         TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP, 32);
     }
     TIFFSetField (m_tif, TIFFTAG_SAMPLESPERPIXEL, m_spec.nchannels);
-    TIFFSetField (m_tif, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT); // always
+    int orientation = m_spec.get_int_attribute("Orientation", 1);
+    TIFFSetField (m_tif, TIFFTAG_ORIENTATION, orientation);
     
-    int bps, sampformat;
+    m_bitspersample = m_spec.get_int_attribute ("oiio:BitsPerSample");
+    int sampformat;
     switch (m_spec.format.basetype) {
     case TypeDesc::INT8:
-        bps = 8;
+        m_bitspersample = 8;
         sampformat = SAMPLEFORMAT_INT;
         break;
     case TypeDesc::UINT8:
-        bps = 8;
+        if (m_bitspersample != 2 && m_bitspersample != 4)
+            m_bitspersample = 8;
         sampformat = SAMPLEFORMAT_UINT;
         break;
     case TypeDesc::INT16:
-        bps = 16;
+        m_bitspersample = 16;
         sampformat = SAMPLEFORMAT_INT;
         break;
     case TypeDesc::UINT16:
-        bps = 16;
+        if (m_bitspersample != 10 && m_bitspersample != 12)
+            m_bitspersample = 16;
+        sampformat = SAMPLEFORMAT_UINT;
+        break;
+    case TypeDesc::INT32:
+        m_bitspersample = 32;
+        sampformat = SAMPLEFORMAT_INT;
+        break;
+    case TypeDesc::UINT32:
+        m_bitspersample = 32;
         sampformat = SAMPLEFORMAT_UINT;
         break;
     case TypeDesc::HALF:
-        // Silently change requests for unsupported 'half' to 'float'
-        m_spec.set_format (TypeDesc::FLOAT);
+        // Adobe extension, see http://chriscox.org/TIFFTN3d1.pdf
+        // Unfortunately, Nuke 9.0, and probably many other apps we care
+        // about, cannot read 16 bit float TIFFs correctly. Revisit this
+        // again in future releases. (comment added Feb 2015)
+        // For now, the default is to NOT write this (instead writing float)
+        // unless the "tiff:half" attribute is nonzero -- use the global
+        // OIIO attribute, but override with a specific attribute for this
+        // file.
+        if (m_spec.get_int_attribute("tiff:half", OIIO::get_int_attribute("tiff:half"))) {
+            m_bitspersample = 16;
+        } else {
+            // Silently change requests for unsupported 'half' to 'float'
+            m_bitspersample = 32;
+            m_spec.set_format (TypeDesc::FLOAT);
+        }
+        sampformat = SAMPLEFORMAT_IEEEFP;
+        break;
     case TypeDesc::FLOAT:
-        bps = 32;
+        m_bitspersample = 32;
         sampformat = SAMPLEFORMAT_IEEEFP;
         break;
     case TypeDesc::DOUBLE:
-        bps = 64;
+        m_bitspersample = 64;
         sampformat = SAMPLEFORMAT_IEEEFP;
         break;
     default:
-        error ("TIFF doesn't support %s images (\"%s\")",
-               m_spec.format.c_str(), name.c_str());
-        close();
-        return false;
+        // Everything else, including UNKNOWN -- default to 8 bit
+        m_bitspersample = 8;
+        sampformat = SAMPLEFORMAT_UINT;
+        m_spec.set_format (TypeDesc::UINT8);
+        break;
     }
-    TIFFSetField (m_tif, TIFFTAG_BITSPERSAMPLE, bps);
+    TIFFSetField (m_tif, TIFFTAG_BITSPERSAMPLE, m_bitspersample);
     TIFFSetField (m_tif, TIFFTAG_SAMPLEFORMAT, sampformat);
 
-    int photo = (m_spec.nchannels > 1 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
-    TIFFSetField (m_tif, TIFFTAG_PHOTOMETRIC, photo);
+    m_photometric = (m_spec.nchannels > 1 ? PHOTOMETRIC_RGB : PHOTOMETRIC_MINISBLACK);
+
+    string_view comp = m_spec.get_string_attribute("Compression", "zip");
+    if (Strutil::iequals (comp, "jpeg") &&
+        (m_spec.format != TypeDesc::UINT8 || m_spec.nchannels != 3)) {
+        comp = "zip";   // can't use JPEG for anything but 3xUINT8
+    }
+    m_compression = tiff_compression_code (comp);
+    TIFFSetField (m_tif, TIFFTAG_COMPRESSION, m_compression);
+
+    // Use predictor when using compression
+    if (m_compression == COMPRESSION_LZW || m_compression == COMPRESSION_ADOBE_DEFLATE) {
+        if (m_spec.format == TypeDesc::FLOAT || m_spec.format == TypeDesc::DOUBLE || m_spec.format == TypeDesc::HALF) {
+            TIFFSetField (m_tif, TIFFTAG_PREDICTOR, PREDICTOR_FLOATINGPOINT);
+            // N.B. Very old versions of libtiff did not support this
+            // predictor.  It's possible that certain apps can't read
+            // floating point TIFFs with this set.  But since it's been
+            // documented since 2005, let's take our chances.  Comment
+            // out the above line if this is problematic.
+        }
+        else if (m_bitspersample == 8 || m_bitspersample == 16) {
+            // predictors not supported for unusual bit depths (e.g. 10)
+            TIFFSetField (m_tif, TIFFTAG_PREDICTOR, PREDICTOR_HORIZONTAL);
+        }
+        if (m_compression == COMPRESSION_ADOBE_DEFLATE) {
+            int q = m_spec.get_int_attribute ("tiff:zipquality", -1);
+            if (q >= 0)
+                TIFFSetField (m_tif, TIFFTAG_ZIPQUALITY, OIIO::clamp(q, 1, 9));
+        }
+    } else if (m_compression == COMPRESSION_JPEG) {
+        TIFFSetField (m_tif, TIFFTAG_JPEGQUALITY,
+                      m_spec.get_int_attribute("CompressionQuality", 95));
+        TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP, 64);
+        m_spec.attribute ("tiff:RowsPerStrip", 64);
+        if (m_photometric == PHOTOMETRIC_RGB) {
+            // Compression works so much better when we ask the library to
+            // auto-convert RGB to YCbCr.
+            TIFFSetField (m_tif, TIFFTAG_JPEGCOLORMODE, JPEGCOLORMODE_RGB);
+            m_photometric = PHOTOMETRIC_YCBCR;
+        }
+    }
+    m_outputchans = m_spec.nchannels;
+    if (m_photometric == PHOTOMETRIC_RGB) {
+        // There are a few ways in which we allow allow the user to specify
+        // translation to different photometric types.
+        string_view photo = m_spec.get_string_attribute("tiff:ColorSpace");
+        if (Strutil::iequals (photo, "CMYK")) {
+            // CMYK: force to 4 channel output, either uint8 or uint16
+            m_photometric = PHOTOMETRIC_SEPARATED;
+            m_outputchans = 4;
+            TIFFSetField (m_tif, TIFFTAG_SAMPLESPERPIXEL, m_outputchans);
+            if (m_spec.format != TypeDesc::UINT8 || m_spec.format != TypeDesc::UINT16) {
+                m_spec.format = TypeDesc::UINT8;
+                m_bitspersample = 8;
+                TIFFSetField (m_tif, TIFFTAG_BITSPERSAMPLE, m_bitspersample);
+                TIFFSetField (m_tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_UINT);
+            }
+        }
+    }
+
+    TIFFSetField (m_tif, TIFFTAG_PHOTOMETRIC, m_photometric);
 
     // ExtraSamples tag
-    if (m_spec.nchannels > 3) {
+    if (m_spec.nchannels > 3 && m_photometric != PHOTOMETRIC_SEPARATED) {
         bool unass = m_spec.get_int_attribute("oiio:UnassociatedAlpha", 0);
         short e = m_spec.nchannels-3;
         std::vector<unsigned short> extra (e);
@@ -257,10 +461,6 @@ TIFFOutput::open (const std::string &name, const ImageSpec &userspec,
         TIFFSetField (m_tif, TIFFTAG_EXTRASAMPLES, e, &extra[0]);
     }
 
-    // Default to LZW compression if no request came with the user spec
-    if (! m_spec.find_attribute("compression"))
-        m_spec.attribute ("compression", "lzw");
-
     ImageIOParameter *param;
     const char *str = NULL;
 
@@ -269,13 +469,19 @@ TIFFOutput::open (const std::string &name, const ImageSpec &userspec,
     if ((param = m_spec.find_attribute("planarconfig", TypeDesc::STRING)) ||
         (param = m_spec.find_attribute("tiff:planarconfig", TypeDesc::STRING))) {
         str = *(char **)param->data();
-        if (str && Strutil::iequals (str, "separate")) {
+        if (str && Strutil::iequals (str, "separate"))
             m_planarconfig = PLANARCONFIG_SEPARATE;
-            if (! m_spec.tile_width) {
-                // I can only seem to make separate planarconfig work when
-                // rowsperstrip is 1.
-                TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP, 1);
-            }
+    }
+    // Can't deal with the headache of separate image planes when using
+    // bit packing, or CMYK. Just punt by forcing contig in those cases.
+    if (m_bitspersample != spec().format.size()*8 ||
+            m_photometric == PHOTOMETRIC_SEPARATED)
+        m_planarconfig = PLANARCONFIG_CONTIG;
+    if (m_planarconfig == PLANARCONFIG_SEPARATE) {
+        if (! m_spec.tile_width) {
+            // I can only seem to make separate planarconfig work when
+            // rowsperstrip is 1.
+            TIFFSetField (m_tif, TIFFTAG_ROWSPERSTRIP, 1);
         }
     }
     TIFFSetField (m_tif, TIFFTAG_PLANARCONFIG, m_planarconfig);
@@ -292,8 +498,31 @@ TIFFOutput::open (const std::string &name, const ImageSpec &userspec,
         m_spec.attribute ("DateTime", date);
     }
 
+    // Write ICC profile, if we have anything
+    const ImageIOParameter* icc_profile_parameter = m_spec.find_attribute(ICC_PROFILE_ATTR);
+    if (icc_profile_parameter != NULL) {
+        unsigned char *icc_profile = (unsigned char*)icc_profile_parameter->data();
+        uint32 length = icc_profile_parameter->type().size();
+        if (icc_profile && length)
+            TIFFSetField (m_tif, TIFFTAG_ICCPROFILE, length, icc_profile);
+    }
+
     if (Strutil::iequals (m_spec.get_string_attribute ("oiio:ColorSpace"), "sRGB"))
         m_spec.attribute ("Exif:ColorSpace", 1);
+
+    // Deal with missing XResolution or YResolution, or a PixelAspectRatio
+    // that contradicts them.
+    float X_density = m_spec.get_float_attribute ("XResolution", 1.0f);
+    float Y_density = m_spec.get_float_attribute ("YResolution", 1.0f);
+    float aspect = m_spec.get_float_attribute ("PixelAspectRatio", 1.0f);
+    if (X_density < 1.0f || Y_density < 1.0f || aspect*X_density != Y_density) {
+        if (X_density < 1.0f || Y_density < 1.0f) {
+            X_density = Y_density = 1.0f;
+            m_spec.attribute ("ResolutionUnit", "none");
+        }
+        m_spec.attribute ("XResolution", X_density);
+        m_spec.attribute ("YResolution", X_density * aspect);
+    }
 
     // Deal with all other params
     for (size_t p = 0;  p < m_spec.extra_attribs.size();  ++p)
@@ -315,7 +544,10 @@ TIFFOutput::open (const std::string &name, const ImageSpec &userspec,
     TIFFCheckpointDirectory (m_tif);  // Ensure the header is written early
     m_checkpointTimer.start(); // Initialize the to the fileopen time
     m_checkpointItems = 0; // Number of tiles or scanlines we've written
-    
+
+    m_dither = (m_spec.format == TypeDesc::UINT8) ?
+                    m_spec.get_int_attribute ("oiio:dither", 0) : 0;
+
     return true;
 }
 
@@ -328,36 +560,6 @@ TIFFOutput::put_parameter (const std::string &name, TypeDesc type,
     if (Strutil::iequals(name, "Artist") && type == TypeDesc::STRING) {
         TIFFSetField (m_tif, TIFFTAG_ARTIST, *(char**)data);
         return true;
-    }
-    if (Strutil::iequals(name, "Compression") && type == TypeDesc::STRING) {
-        int compress = COMPRESSION_LZW;  // default
-        const char *str = *(char **)data;
-        if (str) {
-            if (Strutil::iequals (str, "none"))
-                compress = COMPRESSION_NONE;
-            else if (Strutil::iequals (str, "lzw"))
-                compress = COMPRESSION_LZW;
-            else if (Strutil::istarts_with (str, "zip") || Strutil::iequals (str, "deflate"))
-                compress = COMPRESSION_ADOBE_DEFLATE;
-            else if (Strutil::iequals (str, "packbits"))
-                compress = COMPRESSION_PACKBITS;
-            else if (Strutil::iequals (str, "ccittrle"))
-                compress = COMPRESSION_CCITTRLE;
-        }
-        TIFFSetField (m_tif, TIFFTAG_COMPRESSION, compress);
-        // Use predictor when using compression
-        if (compress == COMPRESSION_LZW || compress == COMPRESSION_ADOBE_DEFLATE) {
-            if (m_spec.format == TypeDesc::FLOAT || m_spec.format == TypeDesc::DOUBLE || m_spec.format == TypeDesc::HALF) {
-                TIFFSetField (m_tif, TIFFTAG_PREDICTOR, PREDICTOR_FLOATINGPOINT);
-                // N.B. Very old versions of libtiff did not support this
-                // predictor.  It's possible that certain apps can't read
-                // floating point TIFFs with this set.  But since it's been
-                // documented since 2005, let's take our chances.  Comment
-                // out the above line if this is problematic.
-            }
-            else
-                TIFFSetField (m_tif, TIFFTAG_PREDICTOR, PREDICTOR_HORIZONTAL);
-        }
     }
     if (Strutil::iequals(name, "Copyright") && type == TypeDesc::STRING) {
         TIFFSetField (m_tif, TIFFTAG_COPYRIGHT, *(char**)data);
@@ -400,10 +602,6 @@ TIFFOutput::put_parameter (const std::string &name, TypeDesc type,
             TIFFSetField (m_tif, TIFFTAG_RESOLUTIONUNIT, RESUNIT_CENTIMETER);
         else ok = false;
         return ok;
-    }
-    if (Strutil::iequals(name, "ResolutionUnit") && type == TypeDesc::UINT) {
-        TIFFSetField (m_tif, TIFFTAG_RESOLUTIONUNIT, *(unsigned int *)data);
-        return true;
     }
     if (Strutil::iequals(name, "tiff:RowsPerStrip")
           && ! m_spec.tile_width /* don't set rps for tiled files */
@@ -451,13 +649,106 @@ TIFFOutput::put_parameter (const std::string &name, TypeDesc type,
         TIFFSetField (m_tif, TIFFTAG_YRESOLUTION, *(float *)data);
         return true;
     }
-
-    // FIXME -- we don't currently support writing of EXIF fields.  TIFF
-    // in theory allows it, using a custom IFD directory, but at
-    // present, it appears that libtiff only supports reading custom
-    // IFD's, not writing them.
-
     return false;
+}
+
+
+
+bool
+TIFFOutput::write_exif_data ()
+{
+#if defined(TIFF_VERSION_BIG) && TIFFLIB_VERSION >= 20120922
+    // Older versions of libtiff do not support writing Exif directories
+
+    if (m_spec.get_int_attribute ("tiff:write_exif", 1) == 0) {
+        // The special metadata "tiff:write_exif", if present and set to 0
+        // (the default is 1), will cause us to skip outputting Exif data.
+        // This is useful in cases where we think the TIFF file will need to
+        // be read by an app that links against an old version of libtiff
+        // that will have trouble reading the Exif directory.
+        return true;
+    }
+
+    // First, see if we have any Exif data at all
+    bool any_exif = false;
+    for (size_t i = 0, e = m_spec.extra_attribs.size(); i < e; ++i) {
+        const ImageIOParameter &p (m_spec.extra_attribs[i]);
+        int tag, tifftype, count;
+        if (exif_tag_lookup (p.name(), tag, tifftype, count) &&
+                tifftype != TIFF_NOTYPE) {
+            if (tag == EXIFTAG_SECURITYCLASSIFICATION ||
+                tag == EXIFTAG_IMAGEHISTORY ||
+                tag == EXIFTAG_ISOSPEEDRATINGS)
+                continue;   // libtiff doesn't understand these
+            any_exif = true;
+            break;
+        }
+    }
+    if (! any_exif)
+        return true;
+
+    if (m_compression == COMPRESSION_JPEG) {
+        // For reasons we don't understand, JPEG-compressed TIFF seems
+        // to not output properly without a directory checkpoint here.
+        TIFFCheckpointDirectory (m_tif);
+    }
+
+    // First, finish writing the current directory
+    if (! TIFFWriteDirectory (m_tif)) {
+        error ("failed TIFFWriteDirectory()");
+        return false;
+    }
+
+    // Create an Exif directory
+    if (TIFFCreateEXIFDirectory (m_tif) != 0) {
+        error ("failed TIFFCreateEXIFDirectory()");
+        return false;
+    }
+
+    for (size_t i = 0, e = m_spec.extra_attribs.size(); i < e; ++i) {
+        const ImageIOParameter &p (m_spec.extra_attribs[i]);
+        int tag, tifftype, count;
+        if (exif_tag_lookup (p.name(), tag, tifftype, count) &&
+                tifftype != TIFF_NOTYPE) {
+            if (tag == EXIFTAG_SECURITYCLASSIFICATION ||
+                tag == EXIFTAG_IMAGEHISTORY ||
+                tag == EXIFTAG_ISOSPEEDRATINGS)
+                continue;   // libtiff doesn't understand these
+            bool ok = false;
+            if (tifftype == TIFF_ASCII) {
+                ok = TIFFSetField (m_tif, tag, *(char**)p.data());
+            } else if ((tifftype == TIFF_SHORT || tifftype == TIFF_LONG) &&
+                       p.type() == TypeDesc::SHORT) {
+                ok = TIFFSetField (m_tif, tag, (int)*(short *)p.data());
+            } else if ((tifftype == TIFF_SHORT || tifftype == TIFF_LONG) &&
+                       p.type() == TypeDesc::INT) {
+                ok = TIFFSetField (m_tif, tag, *(int *)p.data());
+            } else if ((tifftype == TIFF_RATIONAL || tifftype == TIFF_SRATIONAL) &&
+                       p.type() == TypeDesc::FLOAT) {
+                ok = TIFFSetField (m_tif, tag, *(float *)p.data());
+            } else if ((tifftype == TIFF_RATIONAL || tifftype == TIFF_SRATIONAL) &&
+                       p.type() == TypeDesc::DOUBLE) {
+                ok = TIFFSetField (m_tif, tag, *(double *)p.data());
+            }
+            if (! ok) {
+                // std::cout << "Unhandled EXIF " << p.name() << " " << p.type() << "\n";
+            }
+        }
+    }
+
+    // Now write the directory of Exif data
+    uint64 dir_offset = 0;
+    if (! TIFFWriteCustomDirectory (m_tif, &dir_offset)) {
+        error ("failed TIFFWriteCustomDirectory() of the Exif data");
+        return false;
+    }
+    // Go back to the first directory, and add the EXIFIFD pointer. 
+    // std::cout << "diffdir = " << tiffdir << "\n";
+    TIFFSetDirectory (m_tif, 0);
+    TIFFSetField (m_tif, TIFFTAG_EXIFIFD, dir_offset);
+#endif
+
+    return true;  // all is ok
 }
 
 
@@ -465,8 +756,10 @@ TIFFOutput::put_parameter (const std::string &name, TypeDesc type,
 bool
 TIFFOutput::close ()
 {
-    if (m_tif)
+    if (m_tif) {
+        write_exif_data ();
         TIFFClose (m_tif);    // N.B. TIFFClose doesn't return a status code
+    }
     init ();      // re-initialize
     return true;  // How can we fail?
 }
@@ -476,8 +769,7 @@ TIFFOutput::close ()
 /// Helper: Convert n pixels from contiguous (RGBRGBRGB) to separate
 /// (RRRGGGBBB) planarconfig.
 void
-TIFFOutput::contig_to_separate (int n, const unsigned char *contig,
-                                unsigned char *separate)
+TIFFOutput::contig_to_separate (int n, const char *contig, char *separate)
 {
     int channelbytes = m_spec.channel_bytes();
     for (int p = 0;  p < n;  ++p)                     // loop over pixels
@@ -489,13 +781,130 @@ TIFFOutput::contig_to_separate (int n, const unsigned char *contig,
 
 
 
+// Convert T data[0..nvals-1] in-place to BITS_TO per sample, *packed*.
+// The bit width of T is definitely wider than BITS_TO. T should be an
+// unsigned type.
+template <typename T, int BITS_TO>
+static void
+convert_pack_bits (T *data, int nvals)
+{
+    const int BITS_FROM = sizeof(T)*8;
+    T *in = data;
+    T *out = in - 1;    // because we'll increment first time through
+
+    int bitstofill = 0;
+    // Invariant: the next value to convert is *in. We're going to write
+    // the result of the conversion starting at *out, which still has
+    // bitstofill bits left before moving on to the next slot.
+    for (int i = 0; i < nvals; ++i) {
+        // Grab the next value and convert it
+        T val = bit_range_convert<BITS_FROM,BITS_TO> (*in++);
+        // If we have no more bits to fill in the slot, move on to the
+        // next slot.
+        if (bitstofill == 0) {
+            ++out; *out = 0;        // move to next slot and clear its bits
+            bitstofill = BITS_FROM; // all bits are for the taking
+        }
+        if (bitstofill >= BITS_TO) {
+            // we can fit the whole val in this slot
+            *out |= val << (bitstofill - BITS_TO);
+            bitstofill -= BITS_TO;
+            // printf ("\t\t%d bits left\n", bitstofill);
+        } else {
+            // not enough bits -- will need to split across slots
+            int bitsinnext = BITS_TO - bitstofill;
+            *out |= val >> bitsinnext;
+            val &= (1 << bitsinnext) - 1;  // mask out bits we saved
+            ++out; *out = 0;        // move to next slot and clear its bits
+            *out |= val << (BITS_FROM - bitsinnext);
+            bitstofill = BITS_FROM - bitsinnext;
+        }
+    }
+    // Because we filled in a big-endian way, swap bytes if we need to
+    if (littleendian())
+        swap_endian (data, nvals);
+}
+
+
+
+template<typename T>
+static void
+rgb_to_cmyk (int n, const T *rgb, size_t rgb_stride,
+             T *cmyk, size_t cmyk_stride)
+{
+    for ( ; n; --n, cmyk += cmyk_stride, rgb += rgb_stride) {
+        float R = convert_type<T,float>(rgb[0]);
+        float G = convert_type<T,float>(rgb[1]);
+        float B = convert_type<T,float>(rgb[2]);
+        float one_minus_K = std::max (R, std::max(G, B));
+        float one_minus_K_inv = (one_minus_K <= 1e-6) ? 0.0f : 1.0f/one_minus_K;
+        float C = (one_minus_K - R) * one_minus_K_inv;
+        float M = (one_minus_K - G) * one_minus_K_inv;
+        float Y = (one_minus_K - B) * one_minus_K_inv;
+        float K = 1.0f - one_minus_K;
+        cmyk[0] = convert_type<float,T>(C);
+        cmyk[1] = convert_type<float,T>(M);
+        cmyk[2] = convert_type<float,T>(Y);
+        cmyk[3] = convert_type<float,T>(K);
+    }
+}
+
+
+
+void*
+TIFFOutput::convert_to_cmyk (int npixels, const void* data)
+{
+    std::vector<unsigned char> cmyk (m_outputchans * spec().format.size() * npixels);
+    if (spec().format == TypeDesc::UINT8) {
+        rgb_to_cmyk (npixels, (unsigned char *)data, m_spec.nchannels,
+                     (unsigned char *)&cmyk[0], m_outputchans);
+    } else if (spec().format == TypeDesc::UINT16) {
+        rgb_to_cmyk (npixels, (unsigned short *)data, m_spec.nchannels,
+                     (unsigned short *)&cmyk[0], m_outputchans);
+    } else {
+        ASSERT (0 && "CMYK should be forced to UINT8 or UINT16");
+    }
+    m_scratch.swap (cmyk);
+    return &m_scratch[0];
+}
+
+
+
 bool
 TIFFOutput::write_scanline (int y, int z, TypeDesc format,
                             const void *data, stride_t xstride)
 {
     m_spec.auto_stride (xstride, format, spec().nchannels);
     const void *origdata = data;
-    data = to_native_scanline (format, data, xstride, m_scratch);
+    data = to_native_scanline (format, data, xstride, m_scratch,
+                               m_dither, y, z);
+
+    // Handle weird photometric/color spaces
+    if (m_photometric == PHOTOMETRIC_SEPARATED)
+        data = convert_to_cmyk (spec().width, data);
+
+    // Handle weird bit depths
+    if (spec().format.size()*8 != m_bitspersample) {
+        // Move to scratch area if not already there
+        imagesize_t nbytes = spec().scanline_bytes();
+        int nvals = spec().width * m_outputchans;
+        if (data == origdata) {
+            m_scratch.assign ((unsigned char *)data,
+                              (unsigned char *)data+nbytes);
+            data = &m_scratch[0];
+        }
+        if (spec().format == TypeDesc::UINT16 && m_bitspersample == 10) {
+            convert_pack_bits<unsigned short, 10> ((unsigned short *)data, nvals);
+        } else if (spec().format == TypeDesc::UINT16 && m_bitspersample == 12) {
+            convert_pack_bits<unsigned short, 12> ((unsigned short *)data, nvals);
+        } else if (spec().format == TypeDesc::UINT8 && m_bitspersample == 4) {
+            convert_pack_bits<unsigned char, 4> ((unsigned char *)data, nvals);
+        } else if (spec().format == TypeDesc::UINT8 && m_bitspersample == 2) {
+            convert_pack_bits<unsigned char, 2> ((unsigned char *)data, nvals);
+        } else {
+            ASSERT (0 && "unsupported bit conversion -- shouldn't reach here");
+        }
+    }
 
     y -= m_spec.y;
     if (m_planarconfig == PLANARCONFIG_SEPARATE) {
@@ -504,10 +913,12 @@ TIFFOutput::write_scanline (int y, int z, TypeDesc format,
         std::vector<unsigned char> scratch2 (m_spec.scanline_bytes());
         std::swap (m_scratch, scratch2);
         m_scratch.resize (m_spec.scanline_bytes());
-        contig_to_separate (m_spec.width, (const unsigned char *)data, &m_scratch[0]);
+        contig_to_separate (m_spec.width, (const char *)data, (char *)&m_scratch[0]);
         for (int c = 0;  c < m_spec.nchannels;  ++c) {
             if (TIFFWriteScanline (m_tif, (tdata_t)&m_scratch[plane_bytes*c], y, c) < 0) {
-                error ("TIFFWriteScanline failed");
+                std::string err = oiio_tiff_last_error();
+                error ("TIFFWriteScanline failed writing line y=%d,z=%d (%s)",
+                       y, z, err.size() ? err.c_str() : "unknown error");
                 return false;
             }
         }
@@ -521,21 +932,23 @@ TIFFOutput::write_scanline (int y, int z, TypeDesc format,
             data = &m_scratch[0];
         }
         if (TIFFWriteScanline (m_tif, (tdata_t)data, y) < 0) {
-            error ("TIFFWriteScanline failed");
+            std::string err = oiio_tiff_last_error();
+            error ("TIFFWriteScanline failed writing line y=%d,z=%d (%s)",
+                   y, z, err.size() ? err.c_str() : "unknown error");
             return false;
         }
     }
     
     // Should we checkpoint? Only if we have enough scanlines and enough
-    // time has passed
-    if (m_checkpointTimer() > DEFAULT_CHECKPOINT_INTERVAL_SECONDS && 
-        m_checkpointItems >= MIN_SCANLINES_OR_TILES_PER_CHECKPOINT) {
+    // time has passed (or if using JPEG compression, for which it seems
+    // necessary).
+    ++m_checkpointItems;
+    if ((m_checkpointTimer() > DEFAULT_CHECKPOINT_INTERVAL_SECONDS ||
+         m_compression == COMPRESSION_JPEG)
+        && m_checkpointItems >= MIN_SCANLINES_OR_TILES_PER_CHECKPOINT) {
         TIFFCheckpointDirectory (m_tif);
         m_checkpointTimer.lap();
         m_checkpointItems = 0;
-    }
-    else {
-        ++m_checkpointItems;
     }
     
     return true;
@@ -554,18 +967,61 @@ TIFFOutput::write_tile (int x, int y, int z,
                         spec().tile_width, spec().tile_height);
     x -= m_spec.x;   // Account for offset, so x,y are file relative, not 
     y -= m_spec.y;   // image relative
+    z -= m_spec.z;
     const void *origdata = data;   // Stash original pointer
-    data = to_native_tile (format, data, xstride, ystride, zstride, m_scratch);
+    data = to_native_tile (format, data, xstride, ystride, zstride,
+                           m_scratch, m_dither, x, y, z);
+
+    // Handle weird photometric/color spaces
+    if (m_photometric == PHOTOMETRIC_SEPARATED)
+        data = convert_to_cmyk (spec().tile_pixels(), data);
+
+    // Handle weird bit depths
+    if (spec().format.size()*8 != m_bitspersample) {
+        // Move to scratch area if not already there
+        imagesize_t nbytes = spec().scanline_bytes();
+        int nvals = int (spec().tile_pixels()) * spec().nchannels;
+        if (data == origdata) {
+            m_scratch.assign ((unsigned char *)data,
+                              (unsigned char *)data+nbytes);
+            data = &m_scratch[0];
+        }
+        if (spec().format == TypeDesc::UINT16 && m_bitspersample == 10) {
+            convert_pack_bits<unsigned short, 10> ((unsigned short *)data, nvals);
+        } else if (spec().format == TypeDesc::UINT16 && m_bitspersample == 12) {
+            convert_pack_bits<unsigned short, 12> ((unsigned short *)data, nvals);
+        } else if (spec().format == TypeDesc::UINT8 && m_bitspersample == 4) {
+            convert_pack_bits<unsigned char, 4> ((unsigned char *)data, nvals);
+        } else if (spec().format == TypeDesc::UINT8 && m_bitspersample == 2) {
+            convert_pack_bits<unsigned char, 2> ((unsigned char *)data, nvals);
+        } else {
+            ASSERT (0 && "unsupported bit conversion -- shouldn't reach here");
+        }
+    }
+
     if (m_planarconfig == PLANARCONFIG_SEPARATE && m_spec.nchannels > 1) {
         // Convert from contiguous (RGBRGBRGB) to separate (RRRGGGBBB)
         imagesize_t tile_pixels = m_spec.tile_pixels();
         imagesize_t plane_bytes = tile_pixels * m_spec.format.size();
         DASSERT (plane_bytes*m_spec.nchannels == m_spec.tile_bytes());
         m_scratch.resize (m_spec.tile_bytes());
-        contig_to_separate (tile_pixels, (const unsigned char *)data, &m_scratch[0]);
+
+        std::unique_ptr<char[]> separate_heap;
+        char *separate = NULL;
+        imagesize_t separate_size = plane_bytes * m_spec.nchannels;
+        if (separate_size <= (1<<16))
+            separate = ALLOCA (char, separate_size);  // <=64k ? stack
+        else {                                        // >64k ? heap
+            separate_heap.reset (new char [separate_size]); // will auto-free
+            separate = separate_heap.get();
+        }
+        contig_to_separate (tile_pixels, (const char *)data, separate);
         for (int c = 0;  c < m_spec.nchannels;  ++c) {
-            if (TIFFWriteTile (m_tif, (tdata_t)&m_scratch[plane_bytes*c], x, y, z, c) < 0) {
-                error ("TIFFWriteTile failed");
+            if (TIFFWriteTile (m_tif, (tdata_t)&separate[plane_bytes*c], x, y, z, c) < 0) {
+                std::string err = oiio_tiff_last_error();
+                error ("TIFFWriteTile failed writing tile x=%d,y=%d,z=%d (%s)",
+                       x+m_spec.x, y+m_spec.y, z+m_spec.z,
+                       err.size() ? err.c_str() : "unknown error");
                 return false;
             }
         }
@@ -579,20 +1035,24 @@ TIFFOutput::write_tile (int x, int y, int z,
             data = &m_scratch[0];
         }
         if (TIFFWriteTile (m_tif, (tdata_t)data, x, y, z, 0) < 0) {
-            error ("TIFFWriteTile failed");
+            std::string err = oiio_tiff_last_error();
+            error ("TIFFWriteTile failed writing tile x=%d,y=%d,z=%d (%s)",
+                   x+m_spec.x, y+m_spec.y, z+m_spec.z,
+                   err.size() ? err.c_str() : "unknown error");
             return false;
         }
     }
     
-    // Should we checkpoint? Only if we have enough tiles and enough time has passed
-    if (m_checkpointTimer() > DEFAULT_CHECKPOINT_INTERVAL_SECONDS && 
-        m_checkpointItems >= MIN_SCANLINES_OR_TILES_PER_CHECKPOINT) {
+    // Should we checkpoint? Only if we have enough tiles and enough
+    // time has passed (or if using JPEG compression, for which it seems
+    // necessary).
+    ++m_checkpointItems;
+    if ((m_checkpointTimer() > DEFAULT_CHECKPOINT_INTERVAL_SECONDS ||
+         m_compression == COMPRESSION_JPEG)
+        && m_checkpointItems >= MIN_SCANLINES_OR_TILES_PER_CHECKPOINT) {
         TIFFCheckpointDirectory (m_tif);
         m_checkpointTimer.lap();
         m_checkpointItems = 0;
-    }
-    else {
-        ++m_checkpointItems;
     }
     
     return true;

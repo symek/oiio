@@ -2,8 +2,8 @@ project(documentation)
 
 set (public_docs
      openimageio.pdf
-     ${OpenImageIO_SOURCE_DIR}/../LICENSE
-     ${OpenImageIO_SOURCE_DIR}/../CHANGES
+     "${OpenImageIO_SOURCE_DIR}/LICENSE"
+     "${OpenImageIO_SOURCE_DIR}/CHANGES.md"
 )
 
 if (INSTALL_DOCS)
@@ -18,7 +18,9 @@ find_package(PythonInterp)
 if (UNIX AND TXT2MAN AND PYTHONINTERP_FOUND)
     message (STATUS "Unix man page documentation will be generated")
     set (cli_tools oiiotool iinfo maketx idiff igrep iconvert)
-    if (USE_QT)
+
+    find_program (IV_FOUND iv)
+    if (IV_FOUND)
         list (APPEND cli_tools iv)
     endif()
 
@@ -27,7 +29,7 @@ if (UNIX AND TXT2MAN AND PYTHONINTERP_FOUND)
         list (APPEND manpage_files ${outfile})
         add_custom_command (OUTPUT ${outfile}
             COMMAND ${tool} --help |
-            ${PYTHON_EXECUTABLE} ${documentation_SOURCE_DIR}/help2man_preformat.py |
+            ${PYTHON_EXECUTABLE} "${documentation_SOURCE_DIR}/help2man_preformat.py" |
             ${TXT2MAN} -v OpenImageIO -s 1 -t ${tool} > ${outfile}
             DEPENDS ${tool} help2man_preformat.py)
     endforeach()
