@@ -14,7 +14,7 @@ IF (EXISTS "$ENV{HT}/" AND IS_DIRECTORY "$ENV{HT}/")
                     ERROR_STRIP_TRAILING_WHITESPACE)
 
     # remove -c from a cxx:
-    string (REPLACE "-c" "" HDK_CXX_FLAGS ${HDK_CXX_FLAGS})
+    string (REPLACE "-c" " " HDK_CXX_FLAGS ${HDK_CXX_FLAGS})
 
 	# linker flags:
 	execute_process(COMMAND hcustom -m 
