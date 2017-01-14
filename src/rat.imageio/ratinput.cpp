@@ -28,18 +28,17 @@
   (This is the Modified BSD License)
 */
 
-// #include <cstdio>
-// #include <cstdlib>
-// #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
 
 
-// #include "dassert.h"
-// #include "typedesc.h"
-#include "imageio.h"
-// #include "thread.h"
-// #include "strutil.h"
-// #include "fmath.h"
-#include "filesystem.h"
+#include "OpenImageIO/dassert.h"
+#include "OpenImageIO/typedesc.h"
+#include "OpenImageIO/imageio.h"
+#include "OpenImageIO/filesystem.h"
+#include "OpenImageIO/fmath.h"
+
 
 #include "IMG/IMG_File.h"
 
@@ -74,12 +73,13 @@ private:
     IMG_FileParms *m_parms;
     IMG_Stat      *m_stat;
     IMG_Format    *m_format;
+    // std::string      m_file; 
 
     int m_subimage;
     int m_miplevel;
     int m_components;
     /// Reset everything to initial state
-    void init () { m_file = NULL; }
+    void init () {  } //m_file = NULL;
 
 };
 
