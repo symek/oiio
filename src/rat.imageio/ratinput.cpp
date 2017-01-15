@@ -54,19 +54,19 @@ public:
     virtual bool valid_file (const std::string &filename) const;
     virtual bool open (const std::string &name, ImageSpec &newspec);
     virtual bool close ();
-    virtual int current_subimage (void) const { return m_subimage; }
-    virtual int current_miplevel (void) const { return m_miplevel; }
-    virtual bool seek_subimage (int subimage, int miplevel, ImageSpec &newspec);
+    // virtual int current_subimage (void) const { return m_subimage; }
+    // virtual int current_miplevel (void) const { return m_miplevel; }
+    // virtual bool seek_subimage (int subimage, int miplevel, ImageSpec &newspec);
     virtual bool read_native_scanline (int y, int z, void *data);
-    virtual bool read_native_scanlines (int ybegin, int yend, int z, void *data);
-    virtual bool read_native_scanlines (int ybegin, int yend, int z,
-                                        int firstchan, int nchans, void *data);
-    virtual bool read_native_tile (int x, int y, int z, void *data);
-    virtual bool read_native_tiles (int xbegin, int xend, int ybegin, int yend,
-                                    int zbegin, int zend, void *data);
-    virtual bool read_native_tiles (int xbegin, int xend, int ybegin, int yend,
-                                    int zbegin, int zend,
-                                    int firstchan, int nchans, void *data);
+    // virtual bool read_native_scanlines (int ybegin, int yend, int z, void *data);
+    // virtual bool read_native_scanlines (int ybegin, int yend, int z,
+    //                                     int firstchan, int nchans, void *data);
+    // virtual bool read_native_tile (int x, int y, int z, void *data);
+    // virtual bool read_native_tiles (int xbegin, int xend, int ybegin, int yend,
+    //                                 int zbegin, int zend, void *data);
+    // virtual bool read_native_tiles (int xbegin, int xend, int ybegin, int yend,
+    //                                 int zbegin, int zend,
+    //                                 int firstchan, int nchans, void *data);
 private:
     std::string   m_filename;           ///< Stash the filename
     IMG_File      *m_file;              ///< Open image handle
@@ -75,21 +75,28 @@ private:
     IMG_Format    *m_format;
     // std::string      m_file; 
 
-    int m_subimage;
-    int m_miplevel;
+    // int m_subimage;
+    // int m_miplevel;
     int m_components;
     /// Reset everything to initial state
-    void init () {  } //m_file = NULL;
+     void init (void) {
+        // m_scanline_size = 0;
+        m_file = NULL;
+        m_filename.clear ();
+    } //m_file = NULL;
 
 };
 
-
-
-// Obligatory material to make this a recognizeable imageio plugin:
+// symbols required for OpenImageIO plugin
 OIIO_PLUGIN_EXPORTS_BEGIN
-OIIO_EXPORT ImageInput *rat_input_imageio_create () { return new RatInput; }
-OIIO_EXPORT int rat_imageio_version = OIIO_PLUGIN_VERSION;
-OIIO_EXPORT const char * rat_input_extensions[] = {"rat", NULL};
+    OIIO_EXPORT int rat_imageio_version = OIIO_PLUGIN_VERSION;
+    OIIO_EXPORT ImageInput *rat_input_imageio_create() {
+        return new RatInput;
+    }
+    OIIO_EXPORT const char *rat_input_extensions[] = {
+        "rat", NULL
+    };
+
 OIIO_PLUGIN_EXPORTS_END
 
 
@@ -103,7 +110,7 @@ bool RatInput::open(const std::string &name, ImageSpec &newspec)
         return false;
     }
 
-     m_file = IMG_File::open(name.c_str(), m_parms, m_format);
+     m_file = IMG_File::open(name.c_str());//, m_parms, m_format
      // NULL if couldn't open
      if (!m_file)
         return false;
@@ -111,6 +118,7 @@ bool RatInput::open(const std::string &name, ImageSpec &newspec)
     // File statistics:
     m_stat = &(m_file->getStat());
     m_components = 0;
+
     // Houdini stores channels inside planes data:
     // like C{RGB}, diff{RGB}, not R/G/B/A/diff.R/diff.G etc:
     for (int i = 0; i < m_stat->getNumPlanes(); i++)
@@ -120,9 +128,7 @@ bool RatInput::open(const std::string &name, ImageSpec &newspec)
     } 
 
     m_spec = ImageSpec(m_stat->getXres(), m_stat->getYres(), m_components, TypeDesc::UINT8);
-    #ifdef DEBUG
-            std::cerr << m_stat->getXres() << ", " << m_stat->getYres() << ", " << m_components << std::endl;
-    #endif
+    std::cout << m_stat->getXres() << ", " << m_stat->getYres() << ", " <<  m_components << ", " << (int)TypeDesc::UINT8 << "\n";
     newspec = m_spec;
     return true;
 }
@@ -130,11 +136,77 @@ bool RatInput::open(const std::string &name, ImageSpec &newspec)
 
 bool RatInput::close() 
 { 
-    m_file->close(); 
+    // m_file->close(); 
     delete m_file; 
     init(); 
     return true;
 }
+
+
+
+
+bool RatInput::read_native_scanline (int y, int z, void *data)
+{
+    return m_file->readIntoBuffer(y, data);
+    // scan_data = static_cast<void*>(new int[100]);
+    // return true;
+
+}
+
+
+bool RatInput::valid_file (const std::string &filename) const
+{
+
+    FILE *fd = Filesystem::fopen (filename, "rb");
+    if (!fd)
+        return false;
+
+    fclose (fd);
+
+    IMG_File *tmp = IMG_File::open(filename.c_str());
+    std::cout << "THis is valid file checked\n";
+
+    if (!tmp)
+        return false;
+
+    delete tmp;
+    return true;
+}
+
+
+
+// bool RatInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
+// {
+//   return true;
+// }
+
+
+// bool RatInput::read_native_scanlines (int ybegin, int yend, int z, void *data) 
+// {
+//   return true;
+// }
+
+// bool RatInput::read_native_scanlines (int ybegin, int yend, int z,
+//                                         int firstchan, int nchans, void *data)
+// {
+//   return true;
+// }
+// bool RatInput::read_native_tile (int x, int y, int z, void *data)
+// {
+//   return true;
+// }
+// bool RatInput::read_native_tiles (int xbegin, int xend, int ybegin, int yend,
+//                                     int zbegin, int zend, void *data)
+// {
+//   return true;
+// }
+// bool RatInput::read_native_tiles (int xbegin, int xend, int ybegin, int yend,
+//                                     int zbegin, int zend,
+//                                     int firstchan, int nchans, void *data)
+// {
+//   return true;
+// }
+
 
 
 OIIO_PLUGIN_NAMESPACE_END

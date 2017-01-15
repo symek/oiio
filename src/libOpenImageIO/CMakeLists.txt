@@ -138,13 +138,6 @@ if (GDCM_FOUND)
     set_property(SOURCE ../dicom.imageio/dicominput.cpp APPEND_STRING PROPERTY COMPILE_FLAGS " -Wno-macro-redefined ")
 endif ()
 
-# Include RAT if using it
-if (HDK_FOUND)
-  include_directories (${HDK_INCLUDE_DIR})
-  target_link_libraries(OpenImageIO ${HDK_LIBRARIES})
-  # set_target_properties(../rat.imageio/ratinput.cpp PROPERTIES COMPILE_FLAGS "${HDK_CXX_FLAGS}")
-  # set_property(SOURCE ../rat.imageio/ratinput.cpp APPEND_STRING PROPERTY COMPILE_FLAGS "${HDK_CXX_FLAGS}")
-endif()
 
 
 
