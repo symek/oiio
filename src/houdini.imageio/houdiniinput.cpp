@@ -52,12 +52,12 @@ class HoudiniInput : public ImageInput
 public:
     HoudiniInput () { init(); }
     virtual ~HoudiniInput () { close(); }
-    virtual const char * format_name (void) const { return "Houdini (PIC/RAT)"; }
+    virtual const char * format_name (void) const { return "Houdini (pic/rat)"; }
     virtual bool valid_file (const std::string &filename) const;
     virtual bool open (const std::string &name, ImageSpec &newspec);
     virtual bool close ();
     // virtual int current_subimage (void) const { return m_subimage; }
-    // virtual int current_miplevel (void) const { return m_miplevel; }
+    // virtual int current_miplevel (void) const { return 0;/*FIXME: tmp*/ }
     virtual bool seek_subimage (int subimage, int miplevel, ImageSpec &newspec);
     virtual bool read_native_scanline (int y, int z, void *data);
     // virtual bool read_native_scanlines (int ybegin, int yend, int z, void *data);
@@ -81,7 +81,7 @@ private:
         int nmiplevels;                   ///< How many MIP levels are there?
         // Imath::Box2i top_datawindow;
         // Imath::Box2i top_displaywindow;
-        std::vector<IMG_DataType> pixeltype; ///< Imf pixel type for each chan
+        std::vector<TypeDesc> pixeltype; ///< Imf pixel type for each chan
         std::vector<int> chanbytes;       ///< Size (in bytes) of each channel
         PartInfo () : initialized(false) { }
         ~PartInfo () { }
@@ -105,11 +105,11 @@ private:
 
     std::vector<PartInfo> m_parts;        ///< Image parts
 
-    std::string   m_filename;           ///< Stash the filename
-    IMG_File      *m_file;              ///< Open image handle
-    IMG_FileParms *m_parms;
-    IMG_Stat      *m_stat;
-    IMG_Format    *m_format;
+    std::string    m_filename;           ///< Stash the filename
+    IMG_File      *m_hdk_file;              ///< Open image handle
+    IMG_FileParms *m_hdk_parms;
+    IMG_Stat      *m_hdk_stat;
+    IMG_Format    *m_hdk_format;
     // std::string      m_file; 
 
     // int m_subimage;
@@ -118,7 +118,7 @@ private:
     /// Reset everything to initial state
      void init (void) {
         // m_scanline_size = 0;
-        m_file = NULL;
+        m_hdk_file = NULL;
         m_filename.clear ();
     } //m_file = NULL;
 
@@ -154,32 +154,30 @@ bool HoudiniInput::open(const std::string &name, ImageSpec &newspec)
     m_miplevel = -1;
     m_filename = name;
 
-    m_file = IMG_File::open(m_filename.c_str());// TODO: allow read-time parms: m_parms, m_format
-     // we need at least horizonatal flip as OIIO image starts upper left.
-     // NULL if couldn't open
-     if (!m_file)
+    m_hdk_file = IMG_File::open(m_filename.c_str());// TODO: allow read-time parms: m_parms, m_format
+    if (!m_hdk_file)
         return false;
 
-    // HDK File statistics:
-    m_stat       = &(m_file->getStat());
-    m_nsubimages = m_stat->getNumPlanes();
+    m_spec       = ImageSpec();
+    m_hdk_stat   = &(m_hdk_file->getStat());
+    m_nsubimages = m_hdk_stat->getNumPlanes();
 
-    // OIIO nsubimages will be here used for every extra channel,
-    // since RAT/PIC hold channels in seprate images with possible
-    // varying bit depth and order.
+    // OIIO sub-images will be used for every extra channel,
+    // since RAT/PIC hold channels in seprate rasters varying components, depth, ordering.
     m_parts.resize(m_nsubimages);
 
     PartInfo &info(m_parts[0]);
     info.nmiplevels = 0; // FIXME: Something fishy here. 
 
     // return true;
-    return seek_subimage (0, 0, newspec);
+    return seek_subimage(0, 0, newspec);
 }
 
 
  bool HoudiniInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
 {
 
+    PartInfo &info(m_parts[subimage]);
 
     if (subimage < 0 || subimage >= m_nsubimages)   // out of range
         return false;
@@ -189,40 +187,45 @@ bool HoudiniInput::open(const std::string &name, ImageSpec &newspec)
         return true;
     }
 
-    PartInfo &info(m_parts[subimage]);
     if (miplevel < 0 || miplevel > info.nmiplevels)   // out of range
         return false;
-
-    // m_miplevel = miplevel;
-
-    // if (miplevel == 0 /*&& info.levelmode == Imf::ONE_LEVEL*/) { // TODO: implement levelnodes etc
-    //     newspec = m_spec;
-    //     return true;
-    // }
-
-    //
-    const IMG_Plane *plane = m_stat->getPlane(subimage);
-    const TypeDesc datatype = TypeDesc_from_HDKPixelType(plane->getDataType());
-    const int components    =  plane->getComponentCount();
-
-    ImageSpec spec = ImageSpec(m_stat->getXres(), m_stat->getYres(), components, datatype);
-    spec.attribute ("XResolution", m_stat->getXres());
-    spec.attribute ("YResolution", m_stat->getYres());
-    spec.attribute ("ResolutionUnit", "m");
-
-    for(uint c=0; c<components; ++c) {
-        std::string channel_name(plane->getName());
-        spec.channelnames.push_back(channel_name + "." + plane->getComponentName(c));
+  
+    if (miplevel == 0 && info.initialized /*&& info.levelmode == Imf::ONE_LEVEL*/) { // TODO: implement levelnodes etc
+        newspec = m_spec;
+        return true;
     }
 
-    // PartInfo &info(m_parts[subimage]);
+    //
+    const IMG_Plane *plane   = m_hdk_stat->getPlane(subimage);
+    const TypeDesc datatype = TypeDesc_from_HDKPixelType(plane->getDataType());
+    const int components    =  plane->getComponentCount();
+    const int pixelsize     =  plane->getPixelSize();
+
+    ImageSpec spec = ImageSpec(m_hdk_stat->getXres(), m_hdk_stat->getYres(), components, datatype);
+    spec.attribute ("XResolution", m_hdk_stat->getXres());
+    spec.attribute ("YResolution", m_hdk_stat->getYres());
+    spec.attribute ("ResolutionUnit", "m");
+
+    for(uint c=0; c<components; ++c)
+    {
+        std::string channel_name(plane->getName());
+        if (components > 1) //getComponentName() crashes for single channle planes
+            spec.channelnames.push_back(channel_name + "." + plane->getComponentName(c));
+        else
+            spec.channelnames.push_back(channel_name);
+
+        info.pixeltype.push_back(datatype);  // same for all channels in HDK (but varying for planes).
+        info.chanbytes.push_back(pixelsize); // as above.
+    }
+
     info.spec = spec;
     info.initialized = true;
-    info.topwidth = m_stat->getXres();
-    info.topheight = m_stat->getYres();
+    info.topwidth = m_hdk_stat->getXres();
+    info.topheight = m_hdk_stat->getYres();
     info.nmiplevels = 0;
     
     newspec = spec;
+    m_spec  = spec;
     m_subimage = subimage;
     m_miplevel = miplevel;
     return true;
@@ -232,7 +235,7 @@ bool HoudiniInput::open(const std::string &name, ImageSpec &newspec)
 
 bool HoudiniInput::close() 
 { 
-    delete m_file; 
+    delete m_hdk_file; 
     init(); 
     return true;
 }
@@ -242,9 +245,9 @@ bool HoudiniInput::close()
 
 bool HoudiniInput::read_native_scanline (int y, int z, void *data)
 {
-    assert(m_subimage < m_stat->getNumPlanes());
-    const IMG_Plane *plane  = m_stat->getPlane(m_subimage); 
-    return m_file->readIntoBuffer(y, data, plane);
+    assert(m_subimage < m_hdk_stat->getNumPlanes());
+    const IMG_Plane *plane  = m_hdk_stat->getPlane(m_subimage); 
+    return m_hdk_file->readIntoBuffer(y, data, plane);
 }
 
 
@@ -255,20 +258,15 @@ bool HoudiniInput::valid_file (const std::string &filename) const
     if (!fd)
         return false;
 
-    fclose (fd);
+    fclose(fd);
 
-   //   int
-   // IMG_HoudiniInput::checkMagic(unsigned int magic) const
-   // {
-   //     // Check if we hit our magic number
-   //    return (magic == MAGIC || magic == MAGIC_SWAP);
-   // }
-  
-
-    IMG_File *tmp = IMG_File::open(filename.c_str());
+    IMG_File *tmp = IMG_File::open(filename.c_str()); // TODO: do magic with magic number?
 
     if (!tmp)
+    {
+        error ("\"%s\" is not a file, Houdini can open.", filename.c_str());
         return false;
+    }
 
     delete tmp;
     return true;
