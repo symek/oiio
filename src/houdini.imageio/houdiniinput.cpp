@@ -55,6 +55,7 @@ public:
     virtual const char * format_name (void) const { return "Houdini (pic/rat)"; }
     virtual bool valid_file (const std::string &filename) const;
     virtual bool open (const std::string &name, ImageSpec &newspec);
+    virtual bool open (const std::string &name, ImageSpec &newspec, const ImageSpec &config);
     virtual bool close ();
     // virtual int current_subimage (void) const { return m_subimage; }
     // virtual int current_miplevel (void) const { return 0;/*FIXME: tmp*/ }
@@ -70,6 +71,7 @@ public:
     //                                 int zbegin, int zend,
     //                                 int firstchan, int nchans, void *data);
 private:
+    bool copy_metadata(ImageSpec &spec);
     struct PartInfo {
         bool initialized;
         ImageSpec spec;
@@ -100,27 +102,34 @@ private:
     int m_subimage;                       ///< What subimage are we looking at?
     int m_nsubimages;                     ///< How many subimages are there?
     int m_miplevel;                       ///< What MIP level are we looking at?
+    int m_components;
+    bool m_keep_unassociated_alpha;
+    bool m_deep;
 
 
 
-    std::vector<PartInfo> m_parts;        ///< Image parts
 
-    std::string    m_filename;           ///< Stash the filename
-    IMG_File      *m_hdk_file;              ///< Open image handle
-    IMG_FileParms *m_hdk_parms;
+    std::vector<PartInfo> m_parts;        /// < Image parts
+    std::string    m_filename;           /// < Stash the filename
+    IMG_File      *m_hdk_scan_file;      /// < Open image handle
+    IMG_File      *m_hdk_tile_file;      /// < Tiled interface version
+    // IMG_FileParms *m_hdk_parms;
+    // IMG_FileParms *m_hdk_parms_tile;
     IMG_Stat      *m_hdk_stat;
     IMG_Format    *m_hdk_format;
-    // std::string      m_file; 
-
-    // int m_subimage;
-    // int m_miplevel;
-    int m_components;
+    std::unique_ptr<char[]> tilebuf;
+    std::shared_ptr<IMG_FileParms> m_hdk_parms_tile;
+    std::shared_ptr<IMG_FileParms> m_hdk_parms;
+     
     /// Reset everything to initial state
      void init (void) {
         // m_scanline_size = 0;
-        m_hdk_file = NULL;
+        m_hdk_scan_file = NULL;
+        m_hdk_tile_file = NULL;
         m_filename.clear ();
-    } //m_file = NULL;
+        m_keep_unassociated_alpha=false;
+        tilebuf.reset();
+    } 
 
 
 };
@@ -140,6 +149,14 @@ OIIO_PLUGIN_EXPORTS_END
 
 
 
+bool HoudiniInput::open(const std::string &name, ImageSpec &newspec, 
+                        const ImageSpec &config) 
+{
+    if (config.get_int_attribute("oiio:UnassociatedAlpha", 0) == 1)
+        m_keep_unassociated_alpha = true; // not sure...
+
+    return open(name, newspec);
+}
 
 bool HoudiniInput::open(const std::string &name, ImageSpec &newspec) 
 {
@@ -154,12 +171,33 @@ bool HoudiniInput::open(const std::string &name, ImageSpec &newspec)
     m_miplevel = -1;
     m_filename = name;
 
-    m_hdk_file = IMG_File::open(m_filename.c_str());// TODO: allow read-time parms: m_parms, m_format
-    if (!m_hdk_file)
-        return false;
+    m_hdk_parms.reset(new IMG_FileParms());
+    m_hdk_parms->flipImageVertical(); // Houdini starts with lower/left, OIIO upper/left
+    m_hdk_scan_file  = IMG_File::open(m_filename.c_str(), m_hdk_parms.get());
 
+    if (!m_hdk_scan_file) {
+        error ("Could not open file \"%s\"", name.c_str());
+        return false;
+    }
+
+    m_hdk_format = m_hdk_scan_file->getFormat();
+   
+    // We keep separate copy of IMG_File for tile based access and probably
+    // for deeps (unless we separete whole *.cpp for this.)
+    if (std::string("RAT").compare(m_hdk_format->getFormatName()) == 0) {
+        m_hdk_parms_tile.reset(new IMG_FileParms());
+        m_hdk_parms_tile->flipImageVertical();
+        m_hdk_parms_tile->useTileInterface();
+        m_hdk_tile_file = IMG_File::open(m_filename.c_str(),  m_hdk_parms_tile.get());
+        if (!m_hdk_tile_file)
+            return false;
+        if(m_hdk_tile_file->getImageType() == IMG_TYPE_DEEP_PIXEL) {
+            m_deep = true;
+        }
+    }
+       
     m_spec       = ImageSpec();
-    m_hdk_stat   = &(m_hdk_file->getStat());
+    m_hdk_stat   = &(m_hdk_scan_file->getStat());
     m_nsubimages = m_hdk_stat->getNumPlanes();
 
     // OIIO sub-images will be used for every extra channel,
@@ -173,6 +211,58 @@ bool HoudiniInput::open(const std::string &name, ImageSpec &newspec)
     return seek_subimage(0, 0, newspec);
 }
 
+
+bool HoudiniInput::copy_metadata(ImageSpec &spec) 
+{
+    std::string attr("houdini:");
+    for (int i = 0; i < m_hdk_scan_file->getNumOptions(); i++) {
+        spec.attribute(attr + m_hdk_scan_file->getOptionName(i), \
+            m_hdk_scan_file->getOptionValue(i));
+    }
+
+    UT_SharedPtr<UT_Options> opt;
+    if (opt = m_hdk_scan_file->imageTextureOptions()) {
+        UT_Options::iterator it;
+        for (it=opt->begin(); it != opt->end(); it.advance()) {
+            const std::string name(it.name());
+            const UT_OptionType type = opt->getOptionType(name);
+
+            if (type == UT_OPTION_MATRIX4) {
+                const UT_Matrix4D mat = opt->getOptionM4(name);
+                spec.attribute(attr + name, TypeDesc::TypeMatrix44, mat.data());
+            }
+            if (type == UT_OPTION_MATRIX3) {
+                const UT_Matrix3D mat = opt->getOptionM3(name);
+                spec.attribute(attr + name, TypeDesc::TypeMatrix33, mat.data());
+            }
+            else if (type == UT_OPTION_STRING) {
+                std::string str;
+                opt->getOptionS(name, str);
+                spec.attribute(attr + name, str);
+            }
+            else if (type == UT_OPTION_FPREAL) {
+                const double d = opt->getOptionF(name);
+                spec.attribute(attr + name, TypeDesc::DOUBLE, static_cast<const void*>(&d));   
+            }
+             else if (type == UT_OPTION_INT) {
+                const int i = opt->getOptionI(name);
+                spec.attribute(attr + name, i);
+            }
+            else if (type == UT_OPTION_VECTOR2) {
+                const UT_Vector2D d = opt->getOptionV2(name);
+                TypeDesc v2(TypeDesc::DOUBLE, TypeDesc::VEC2);
+                spec.attribute(attr + name, v2, static_cast<const void*>(&d));  
+            }
+            else if (type == UT_OPTION_VECTOR3) {
+                const UT_Vector3D d = opt->getOptionV3(name);
+                TypeDesc v3(TypeDesc::DOUBLE, TypeDesc::VEC3);
+                spec.attribute(attr + name, v3, static_cast<const void*>(&d));
+            }
+        }
+    }
+
+    return true;
+}
 
  bool HoudiniInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
 {
@@ -206,7 +296,20 @@ bool HoudiniInput::open(const std::string &name, ImageSpec &newspec)
     spec.attribute ("YResolution", m_hdk_stat->getYres());
     spec.attribute ("ResolutionUnit", "m");
 
-    for(uint c=0; c<components; ++c)
+    // if (m_hdk_tile_file){
+    //     spec.tile_width  = 32;
+    //     spec.tile_height = 32;
+    //     spec.tile_depth  = 1;
+    // }
+
+    spec.deep = (m_hdk_scan_file->getImageType() == IMG_TYPE_DEEP_PIXEL);
+
+    //copy metadata
+    // NOTE: I currently don't provide metadata mapping because I need to figure out
+    // OIIO convention. 
+    copy_metadata(spec);
+    
+    for(uint c=0; c<components; ++c) 
     {
         std::string channel_name(plane->getName());
         if (components > 1) //getComponentName() crashes for single channle planes
@@ -235,19 +338,11 @@ bool HoudiniInput::open(const std::string &name, ImageSpec &newspec)
 
 bool HoudiniInput::close() 
 { 
-    delete m_hdk_file; 
+    delete m_hdk_scan_file;
+    if (m_hdk_tile_file)
+        delete m_hdk_tile_file; 
     init(); 
     return true;
-}
-
-
-
-
-bool HoudiniInput::read_native_scanline (int y, int z, void *data)
-{
-    assert(m_subimage < m_hdk_stat->getNumPlanes());
-    const IMG_Plane *plane  = m_hdk_stat->getPlane(m_subimage); 
-    return m_hdk_file->readIntoBuffer(y, data, plane);
 }
 
 
@@ -272,205 +367,26 @@ bool HoudiniInput::valid_file (const std::string &filename) const
     return true;
 }
 
-// bool HoudiniInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
+
+bool HoudiniInput::read_native_scanline (int y, int z, void *data)
+{
+    assert(m_subimage < m_hdk_stat->getNumPlanes());
+    const IMG_Plane *plane  = m_hdk_stat->getPlane(m_subimage); 
+    return m_hdk_scan_file->readIntoBuffer(y, data, plane);
+}
+
+// bool HoudiniInput::read_native_tile (int x, int y, int z, void *data)
 // {
-//     if (subimage < 0 || subimage >= m_nsubimages)   // out of range
-//         return false;
-
-//     if (subimage == m_subimage && miplevel == m_miplevel) {  // no change
-//         newspec = m_spec;
-//         return true;
-//     }
-
-//     PartInfo &part (m_parts[subimage]);
-
-//     if (! part.initialized) {
-//         const Imf::Header *header = NULL;
-// #ifdef USE_OPENEXR_VERSION2
-//         if (m_input_multipart)
-//             header = &(m_input_multipart->header(subimage));
-// #else
-//         if (m_input_tiled)
-//             header = &(m_input_tiled->header());
-//         if (m_input_scanline)
-//             header = &(m_input_scanline->header());
-// #endif
-//         part.parse_header (header);
-//         part.initialized = true;
-//     }
-
-// #ifdef USE_OPENEXR_VERSION2
-//     if (subimage != m_subimage) {
-//         delete m_scanline_input_part;  m_scanline_input_part = NULL;
-//         delete m_tiled_input_part;  m_tiled_input_part = NULL;
-//         delete m_deep_scanline_input_part;  m_deep_scanline_input_part = NULL;
-//         delete m_deep_tiled_input_part;  m_deep_tiled_input_part = NULL;
-//         try {
-//             if (part.spec.deep) {
-//                 if (part.spec.tile_width)
-//                     m_deep_tiled_input_part = new Imf::DeepTiledInputPart (*m_input_multipart, subimage);
-//                 else
-//                     m_deep_scanline_input_part = new Imf::DeepScanLineInputPart (*m_input_multipart, subimage);
-//             } else {
-//                 if (part.spec.tile_width)
-//                     m_tiled_input_part = new Imf::TiledInputPart (*m_input_multipart, subimage);
-//                 else
-//                     m_scanline_input_part = new Imf::InputPart (*m_input_multipart, subimage);
-//             }
-//         } catch (const std::exception &e) {
-//             error ("OpenEXR exception: %s", e.what());
-//             m_scanline_input_part = NULL;
-//             m_tiled_input_part = NULL;
-//             m_deep_scanline_input_part = NULL;
-//             m_deep_tiled_input_part = NULL;
-//             return false;
-//         } catch (...) {   // catch-all for edge cases or compiler bugs
-//             error ("OpenEXR exception: unknown");
-//             m_scanline_input_part = NULL;
-//             m_tiled_input_part = NULL;
-//             m_deep_scanline_input_part = NULL;
-//             m_deep_tiled_input_part = NULL;
-//             return false;
-//         }
-//     }
-// #endif
-
-//     m_subimage = subimage;
-
-//     if (miplevel < 0 || miplevel >= part.nmiplevels)   // out of range
-//         return false;
-
-//     m_miplevel = miplevel;
-//     m_spec = part.spec;
-
-//     if (miplevel == 0 && part.levelmode == Imf::ONE_LEVEL) {
-//         newspec = m_spec;
-//         return true;
-//     }
-
-//     // Compute the resolution of the requested mip level.
-//     int w = part.topwidth, h = part.topheight;
-//     if (part.levelmode == Imf::MIPMAP_LEVELS) {
-//         while (miplevel--) {
-//             if (part.roundingmode == Imf::ROUND_DOWN) {
-//                 w = w / 2;
-//                 h = h / 2;
-//             } else {
-//                 w = (w + 1) / 2;
-//                 h = (h + 1) / 2;
-//             }
-//             w = std::max (1, w);
-//             h = std::max (1, h);
-//         }
-//     } else if (part.levelmode == Imf::RIPMAP_LEVELS) {
-//         // FIXME
-//     } else {
-//         ASSERT_MSG (0, "Unknown levelmode %d", int(part.levelmode));
-//     }
-
-//     m_spec.width = w;
-//     m_spec.height = h;
-//     // N.B. OpenEXR doesn't support data and display windows per MIPmap
-//     // level.  So always take from the top level.
-//     Imath::Box2i datawindow = part.top_datawindow;
-//     Imath::Box2i displaywindow = part.top_displaywindow;
-//     m_spec.x = datawindow.min.x;
-//     m_spec.y = datawindow.min.y;
-//     if (m_miplevel == 0) {
-//         m_spec.full_x = displaywindow.min.x;
-//         m_spec.full_y = displaywindow.min.y;
-//         m_spec.full_width = displaywindow.max.x - displaywindow.min.x + 1;
-//         m_spec.full_height = displaywindow.max.y - displaywindow.min.y + 1;
-//     } else {
-//         m_spec.full_x = m_spec.x;
-//         m_spec.full_y = m_spec.y;
-//         m_spec.full_width = m_spec.width;
-//         m_spec.full_height = m_spec.height;
-//     }
-//     if (part.cubeface) {
-//         m_spec.full_width = w;
-//         m_spec.full_height = w;
-//     }
-//     newspec = m_spec;
-
-//     return true;
-// }
-
-//      m_spec = ImageSpec(); // Clear everything with default constructor
-    
-//     try {
-//         m_input_stream = new OpenEXRInputStream (name.c_str());
-//     } catch (const std::exception &e) {
-//         m_input_stream = NULL;
-//         error ("OpenEXR exception: %s", e.what());
-//         return false;
-//     } catch (...) {   // catch-all for edge cases or compiler bugs
-//         m_input_stream = NULL;
-//         error ("OpenEXR exception: unknown");
-//         return false;
-//     }
-
-// #ifdef USE_OPENEXR_VERSION2
-//     try {
-//         m_input_multipart = new Imf::MultiPartInputFile (*m_input_stream);
-//     } catch (const std::exception &e) {
-//         delete m_input_stream;
-//         m_input_stream = NULL;
-//         error ("OpenEXR exception: %s", e.what());
-//         return false;
-//     } catch (...) {   // catch-all for edge cases or compiler bugs
-//         m_input_stream = NULL;
-//         error ("OpenEXR exception: unknown");
-//         return false;
-//     }
-
-//     m_nsubimages = m_input_multipart->parts();
-
-// #else
-//     try {
-//         if (tiled) {
-//             m_input_tiled = new Imf::TiledInputFile (*m_input_stream);
-//         } else {
-//             m_input_scanline = new Imf::InputFile (*m_input_stream);
-//         }
-//     } catch (const std::exception &e) {
-//         delete m_input_stream;
-//         m_input_stream = NULL;
-//         error ("OpenEXR exception: %s", e.what());
-//         return false;
-//     } catch (...) {   // catch-all for edge cases or compiler bugs
-//         m_input_stream = NULL;
-//         error ("OpenEXR exception: unknown");
-//         return false;
-//     }
-
-//     if (! m_input_scanline && ! m_input_tiled) {
-//         error ("Unknown error opening EXR file");
-//         return false;
-//     }
-
-//     m_nsubimages = 1;  // OpenEXR 1.x did not have multipart
-// #endif
-
-//     m_parts.resize (m_nsubimages);
-//     m_subimage = -1;
-//     m_miplevel = -1;
-//     bool ok = seek_subimage (0, 0, newspec);
-//     if (! ok)
-//         close ();
-//     return ok;
+//     assert(m_subimage < m_hdk_stat->getNumPlanes()); 
+//     const IMG_Plane *plane  = m_hdk_tile_file->getStat().getPlane(m_subimage);
+//     UT_InclusiveRect rect(x, y, x+m_spec.tile_width, y+m_spec.tile_height);
+//     m_hdk_parms_tile->useTileInterface();
+//     tilebuf.reset(new char [m_spec.tile_bytes(false)]);
+//     data = &tilebuf[0];
+//     return m_hdk_tile_file->readTile(rect, data, plane);
 // }
 
 
-
-
-
-
-
-// bool HoudiniInput::seek_subimage (int subimage, int miplevel, ImageSpec &newspec)
-// {
-//   return true;
-// }
 
 
 // bool HoudiniInput::read_native_scanlines (int ybegin, int yend, int z, void *data) 
@@ -480,10 +396,6 @@ bool HoudiniInput::valid_file (const std::string &filename) const
 
 // bool HoudiniInput::read_native_scanlines (int ybegin, int yend, int z,
 //                                         int firstchan, int nchans, void *data)
-// {
-//   return true;
-// }
-// bool HoudiniInput::read_native_tile (int x, int y, int z, void *data)
 // {
 //   return true;
 // }

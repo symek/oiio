@@ -35,6 +35,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define OPENIMAGEIO_HOUDINI_H
 
 #include "IMG/IMG_File.h"
+#include "IMG/IMG_Format.h"
+#include "UT/UT_Options.h"
+#include "UT/UT_Matrix4.h"
+#include "UT/UT_Vector2.h"
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
 
